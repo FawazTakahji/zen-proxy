@@ -311,6 +311,11 @@ const DEFAULT_CONFIG = {
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: envNum("UA_REFRESH_MS", 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
+  // Ignore a caller-supplied session pair and always speak as the proxy's own
+  // minted identity. Off by default: a real OpenCode client's pair is already
+  // valid, and preserving it is the honest behaviour. On, every caller bucket
+  // gets its own rotating pair even when the client sent one.
+  overrideSession: ENV.OVERRIDE_SESSION === "1" || ENV.OVERRIDE_SESSION === "true",
   // Which credentials the auto-sync health probe uses:
   //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
   //   "key"       — always use defaultZenKey (probe fails if none is set)
@@ -613,7 +618,10 @@ function mintedIdentity(req, now) {
   return fresh
 }
 function identityFor(req, now = Date.now()) {
-  const incoming = req?.headers?.["x-opencode-session"]
+  // A caller-supplied pair is authoritative unless the operator asked the proxy
+  // to speak for the client (`overrideSession`), in which case it is ignored and
+  // a pair is minted like for any other caller.
+  const incoming = config.overrideSession ? undefined : req?.headers?.["x-opencode-session"]
   if (typeof incoming === "string" && incoming.trim()) {
     const callerProject = req?.headers?.["x-opencode-project"]
     return {
@@ -1434,6 +1442,17 @@ function projectHash() {
   return cachedProjectHash
 }
 
+/**
+ * Whether a resolved identity's session pair may go upstream.
+ *
+ * `injectSession: false` suppresses a *minted* pair, but a caller's own pair is
+ * still forwarded (it is theirs). `overrideSession` always sends: the operator
+ * asked the proxy to speak for the client.
+ */
+function sendsSession(identity) {
+  return !identity.injected || config.injectSession || config.overrideSession
+}
+
 function zenHeaders(req, auth) {
   const headers = {
     "content-type": "application/json",
@@ -1445,7 +1464,7 @@ function zenHeaders(req, auth) {
   // Send both session headers whenever we are allowed to supply one. A client
   // that brings its own session keeps it; we just mirror it into the second
   // header so the pair upstream expects is always complete.
-  if (!identity.injected || config.injectSession) {
+  if (sendsSession(identity)) {
     for (const h of SESSION_HEADERS) headers[h] = identity.session
     // v2 parity: the affinity pair echoes the same value under two more names.
     headers["x-session-affinity"] = identity.session
@@ -3793,6 +3812,7 @@ async function handleApiConfig(req, res) {
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
+      cleaned.overrideSession = toBool(cleaned.overrideSession, config.overrideSession)
       cleaned.torEnabled = toBool(cleaned.torEnabled, config.torEnabled)
       cleaned.torStrictNodes = toBool(cleaned.torStrictNodes, config.torStrictNodes)
       cleaned.torProof = toBool(cleaned.torProof, config.torProof)
@@ -3984,7 +4004,9 @@ function upstreamFetch(url, init, opts = {}) {
  *
  * A caller that brought its own `x-opencode-session` keeps it: its identity is
  * never rotated and it is pinned to a single lane, because racing one session
- * from five addresses is exactly what earns 403 FreeTierError.
+ * from five addresses is exactly what earns 403 FreeTierError. `overrideSession`
+ * flips that: the caller's pair is ignored, the request carries a lane-minted
+ * one, and it races like any anonymous caller.
  */
 function laneOpts(req) {
   if (!config.torEnabled) return {}
@@ -4028,7 +4050,7 @@ async function handleTest(req, res) {
         const identity = identityFor(req)
         // Same identity pair the request path sends, so TEST reports what a
         // real client with these headers would see (v2 parity, project included).
-        if (!identity.injected || config.injectSession) {
+        if (sendsSession(identity)) {
           for (const name of SESSION_HEADERS) h[name] = identity.session
           h["x-session-affinity"] = identity.session
           h["x-session-id"] = identity.session

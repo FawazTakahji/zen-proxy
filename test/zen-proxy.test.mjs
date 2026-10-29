@@ -345,6 +345,36 @@ describe("session injection", () => {
     assert.equal(h["x-opencode-session"], "ses_fromclient01")
     assert.equal(h["x-opencode-session-id"], "ses_fromclient01")
   })
+
+  test("overrideSession replaces a client-supplied pair with the proxy's own", () => {
+    zp.saveConfig({ overrideSession: true })
+    try {
+      const req = mockReq({
+        remoteAddress: "7.7.1.1",
+        headers: { "x-opencode-session": "ses_client_owns_this", "x-opencode-project": "client-project" },
+      })
+      const h = zp.zenHeaders(req, "Bearer public")
+      assert.notEqual(h["x-opencode-session"], "ses_client_owns_this", "the caller's session is ignored")
+      assert.match(h["x-opencode-session"], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, "and a real-format id takes its place")
+      assert.notEqual(h["x-opencode-project"], "client-project", "the project half is minted with it")
+      const id = zp.identityFor(req)
+      assert.equal(h["x-opencode-session"], id.session)
+      assert.equal(h["x-opencode-project"], id.project, "session and project are the same minted pair")
+    } finally {
+      zp.saveConfig({ overrideSession: false })
+    }
+  })
+
+  test("overrideSession wins even with injectSession off", () => {
+    zp.saveConfig({ overrideSession: true, injectSession: false })
+    try {
+      const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": "ses_client_pair" } }), "Bearer public")
+      assert.ok(h["x-opencode-session"], "an explicit override is never silently dropped")
+      assert.notEqual(h["x-opencode-session"], "ses_client_pair")
+    } finally {
+      zp.saveConfig({ overrideSession: false, injectSession: true })
+    }
+  })
 })
 
 describe("identityFor", () => {
@@ -470,6 +500,16 @@ describe("tor lane routing", () => {
       assert.deepEqual(zp.laneOpts(mockReq()), { identity: true })
     } finally {
       restore()
+    }
+  })
+
+  test("overrideSession makes a client-supplied session race per lane too", () => {
+    zp.saveConfig({ torEnabled: true, overrideSession: true })
+    try {
+      const req = mockReq({ headers: { "x-opencode-session": "ses_caller_owned" } })
+      assert.deepEqual(zp.laneOpts(req), { identity: true }, "the caller's pair is ignored, so nothing to pin")
+    } finally {
+      zp.saveConfig({ torEnabled: false, overrideSession: false })
     }
   })
 

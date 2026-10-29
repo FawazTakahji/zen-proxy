@@ -452,6 +452,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgAutoUA"><span>Auto-track opencode releases &amp; update the User-Agent</span></div>
       <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgOverride"><span>Override a client-supplied session/project with the proxy's own rotating pair</span></div>
       <div class="row" style="margin-top:26px"><span class="hh" style="font-family:var(--mono);font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase">Tor exit lanes</span></div>
       <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. A call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
       <div class="checkbox"><input type="checkbox" id="cfgTor"><span>Route upstream calls through Tor exit lanes</span></div>
@@ -838,6 +839,7 @@ async function populateConfigForm() {
   $("cfgAutoUA").checked = config.autoUA !== false
   $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
   $("cfgInject").checked = config.injectSession !== false
+  $("cfgOverride").checked = !!config.overrideSession
   $("cfgTor").checked = !!config.torEnabled
   $("cfgTorLanes").value = config.torLanes ?? 10
   $("cfgTorRace").value = config.torRaceWidth ?? 5
@@ -888,6 +890,7 @@ async function saveConfig() {
     autoUA: $("cfgAutoUA").checked,
     uaRefreshMs: Number($("cfgUaMs").value || 21600000),
     injectSession: $("cfgInject").checked,
+    overrideSession: $("cfgOverride").checked,
     torEnabled: $("cfgTor").checked,
     torLanes: Number($("cfgTorLanes").value || 10),
     torRaceWidth: Number($("cfgTorRace").value || 5),
