@@ -78,7 +78,8 @@ if (-not (Test-Path $ConfigPath)) {
 $Script = Join-Path $InstallDir "zen-proxy.ps1"
 Set-Content -Path $Script -Value @"
 # Zen Proxy launcher
-node "$InstallDir\zen-proxy.mjs" `$args
+`$__zpRunner = if (Get-Command bun -ErrorAction SilentlyContinue) { "bun" } else { "node" }
+& `$__zpRunner "$InstallDir\zen-proxy.mjs" `$args
 "@
 
 # Put `zen-proxy` and `zen-claude` on PATH so Windows gets the same two-command
@@ -88,7 +89,12 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
 Set-Content -Path (Join-Path $BinDir "zen-proxy.cmd") -Value @"
 @echo off
-node "$InstallDir\zen-proxy.mjs" %*
+where bun >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+  bun "$InstallDir\zen-proxy.mjs" %*
+) else (
+  node "$InstallDir\zen-proxy.mjs" %*
+)
 "@
 
 foreach ($shim in @("claude-zen.ps1", "claude-zen.cmd")) {

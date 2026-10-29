@@ -53,13 +53,18 @@ function Test-ZenProxy {
     } catch { return $false }
 }
 
+# The free tier (and therefore the Tor lanes) needs Bun's TLS stack; node is
+# the BYOK fallback, exactly as the POSIX launcher chooses.
+$runner = "node"
+if (Get-Command bun -ErrorAction SilentlyContinue) { $runner = "bun" }
+
 # ---- 3. Start the proxy if it is not already up ----------------------------
 $proc = $null
 $log = $null
 if (-not (Test-ZenProxy)) {
     [Console]::Error.WriteLine("zen-claude: starting zen-proxy on port $port ...")
     $log = Join-Path $env:TEMP ("zen-proxy." + [guid]::NewGuid().ToString() + ".log")
-    $proc = Start-Process -FilePath "node" -ArgumentList $main -PassThru -NoNewWindow `
+    $proc = Start-Process -FilePath $runner -ArgumentList $main -PassThru -NoNewWindow `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     $ok = $false
     for ($i = 0; $i -lt 40; $i++) {
@@ -80,28 +85,38 @@ if (-not (Test-ZenProxy)) {
     # watcher knows Claude Code is still going.
     $runFlag = Join-Path $env:TEMP ("zen-claude-run." + [guid]::NewGuid().ToString() + ".flag")
     Set-Content -Path $runFlag -Value "1"
-    $watcher = Start-ThreadJob -ScriptBlock {
-        param($Main, $Port, $Log, $RunFlag)
-        $restarts = 0
-        while (Test-Path $RunFlag) {
-            Start-Sleep -Seconds 2
-            if (-not (Test-Path $RunFlag)) { break }
-            try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -UseBasicParsing } catch { $r = $null }
-            if ($r) { continue }
-            $restarts++
-            if ($restarts -gt 10) {
-                [Console]::Error.WriteLine("zen-claude: zen-proxy kept dying; giving up on restarts.")
-                break
+    # Start-ThreadJob ships with PowerShell 7 and some 5.1 builds; a bare 5.1
+    # without the ThreadJob module must still get a working session, so fall back
+    # to a process job. The runner is passed as an argument: a job is its own
+    # runspace and cannot see this script's variables.
+    $newJob = if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) { "Start-ThreadJob" } else { "Start-Job" }
+    $watcher = $null
+    try {
+        $watcher = & $newJob -ScriptBlock {
+            param($Main, $Port, $Log, $RunFlag, $Runner)
+            $restarts = 0
+            while (Test-Path $RunFlag) {
+                Start-Sleep -Seconds 2
+                if (-not (Test-Path $RunFlag)) { break }
+                try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -UseBasicParsing } catch { $r = $null }
+                if ($r) { continue }
+                $restarts++
+                if ($restarts -gt 10) {
+                    [Console]::Error.WriteLine("zen-claude: zen-proxy kept dying; giving up on restarts.")
+                    break
+                }
+                [Console]::Error.WriteLine("zen-claude: zen-proxy stopped, restarting ($restarts/10)...")
+                Start-Process -FilePath $Runner -ArgumentList $Main -NoNewWindow `
+                    -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" | Out-Null
+                for ($i = 0; $i -lt 40; $i++) {
+                    try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -UseBasicParsing; break } catch { }
+                    Start-Sleep -Milliseconds 250
+                }
             }
-            [Console]::Error.WriteLine("zen-claude: zen-proxy stopped, restarting ($restarts/10)...")
-            Start-Process -FilePath "node" -ArgumentList $Main -NoNewWindow `
-                -RedirectStandardOutput $Log -RedirectStandardError "$Log.err" | Out-Null
-            for ($i = 0; $i -lt 40; $i++) {
-                try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -UseBasicParsing; break } catch { }
-                Start-Sleep -Milliseconds 250
-            }
-        }
-    } -ArgumentList $main, $port, $log, $runFlag
+        } -ArgumentList $main, $port, $log, $runFlag, $runner
+    } catch {
+        [Console]::Error.WriteLine("zen-claude: could not start the proxy watcher: $($_.Exception.Message)")
+    }
 }
 
 # ---- 4. Build settings that list every free model -------------------------

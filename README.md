@@ -148,6 +148,42 @@ For replies, one rule: a reply may only carry calls your agent can actually run.
 
 ---
 
+## Tor exit lanes
+
+The free tier meters per **exit IP**: 200 requests a day, resetting at 00:00 UTC. One address runs dry while the proxy is otherwise healthy. `zen-proxy` can spread that over a fleet of local Tor processes, one per exit relay — the [`lingling`](https://github.com/12errh/lingling) idea, ported.
+
+Off by default. Turn it on with `TOR=1 bun zen-proxy.mjs`, from the dashboard (Settings → Tor exit lanes), or with `"torEnabled": true` in `zen-proxy.json`.
+
+```bash
+TOR=1 TOR_LANES=10 TOR_RACE_WIDTH=5 bun zen-proxy.mjs
+```
+
+How it behaves:
+
+- **Ten lanes, five wide.** Each lane is its own `tor` process in its own data directory, pinned to a distinct exit relay. A model call is sent down **five** lanes at once; the first `200` takes the client and the rest are cut before they say a word. Five is measured, not shy: the gate refuses a client it sees arrive from half a dozen addresses for one session (`403 FreeTierError`), and once refused, refuses it through every exit. Ten lanes still spread the day's allowance.
+- **Refusals are charged per exit.** A `429 FreeUsageLimitError` sits that exit out until 00:00 UTC, a burst `429` for ~25 minutes, a gate `403` for 5 minutes. A spent exit is skipped by the race and the sweep moves its lane to a fresh relay.
+- **Exits are left before they are spent.** After `torExitSoftCap` requests (100, half the daily wall) or `torExitHoldS` seconds (600), a lane moves to another relay — the only way to learn somebody else spent an exit's allowance is to be refused.
+- **One lane, one identity.** Each lane mints its own session + project pair and rotates it with the exit. A caller that brings its own `x-opencode-session` is the exception: it is pinned to a single lane and its identity is never touched, because racing one session from five addresses is what earns the 403.
+- **The TLS fingerprint is untouched.** Bun's `fetch` speaks HTTP CONNECT to the lane's `HTTPTunnelPort`; only the exit IP changes.
+
+Two requirements and one warning:
+
+- **Bun.** Node's `fetch` accepts a `proxy` option and silently ignores it, so lanes refuse to start under Node and log why ("tor lanes need Bun"). BYOK still works on Node without lanes.
+- **A tor binary.** The first enabled run downloads the Tor Expert Bundle (~30 MB, once) into `torDataDir` (default: the OS temp directory). A usable `tor` on `PATH`, or `torBinary`, is used instead. A stale system tor (0.4.7 and older) cannot join the current network; the bundle exists for that reason.
+- **Tor is slow and shared.** Racing five copies multiplies upstream load and adds latency, and public exits are used by everyone. This is a way to keep working when one address hits a wall, not a way to evade a ban. The ledger lives in `torDataDir/tor-ledger.json`; delete it to forget every verdict.
+
+| Key | Default | Description |
+|---|---|---|
+| `torEnabled` | `false` | Start the lane fleet and route upstream calls through it (needs Bun) |
+| `torLanes` / `torRaceWidth` | `10` / `5` | Tor processes / copies per call. Both are clamped to 1–64 |
+| `torCountries` / `torFallbackCountries` / `torPreferredCountries` | `us,de,nl,fr,ro,gb,ca,se,pl,ch` / `""` / `""` | Comma-separated two-letter exit countries; preferred are tried first, fallback when the main pool has no headroom |
+| `torExitSoftCap` / `torExitHoldS` / `torSweepS` | `100` / `600` / `20` | Leave an exit after this many requests or seconds; how often the sweep looks |
+| `torSweepMoves` / `torRounds` / `torStreamGraceS` | `3` / `2` / `120` | Lanes moved per sweep; pool walks when every lane fails; quiet period after a reply so a body can finish |
+| `torDataDir` / `torBinary` | `""` / `""` | State (lanes, ledger, tor bundle) and an explicit tor path. Moving the data dir needs a restart |
+| `torDownload` / `torProof` / `torStrictNodes` / `torMaxCircuitDirtiness` | `true` / `true` / `true` / `600` | Download the bundle when needed; prove each exit through `check.torproject.org`; refuse a fallback outside the pinned relay; circuit rotation window |
+
+---
+
 ## Configuration
 
 `zen-proxy.json`, created on first run, hot-reloaded, and editable from the dashboard. Environment variables override at startup.
@@ -175,9 +211,9 @@ For replies, one rule: a reply may only carry calls your agent can actually run.
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
 
-**Caller identity.** Upstream ties free usage to a session+project pair, not to a key: one pair reads as one CLI conversation in one project. The proxy keeps that story coherent instead of stretching a single anonymous session for everyone — each caller bucket (source IP + user-agent family, versions normalized away) gets its own pair, minted together and rotated together on a 30-minute schedule, so two agents on one machine read as two CLI conversations rather than one marathon session. A client that sends its own `x-opencode-session` / `x-opencode-project` keeps them untouched, and `projectHash` pins the project half for anonymous callers. Every forwarded request leaves one `/api/logs` line carrying the session id's head and tail and its injected/client origin, so rotation is observable. This redistributes identical total usage across more honest identities — and it deliberately stops there: caller IPs are never rotated (the free tier is per-IP; `trustForwarded` alone governs how real IPs travel), so per-IP usage accounting is left exactly as opencode counts it.
+**Caller identity.** Upstream ties free usage to a session+project pair, not to a key: one pair reads as one CLI conversation in one project. The proxy keeps that story coherent instead of stretching a single anonymous session for everyone — each caller bucket (source IP + user-agent family, versions normalized away) gets its own pair, minted together and rotated together on a 30-minute schedule, so two agents on one machine read as two CLI conversations rather than one marathon session. A client that sends its own `x-opencode-session` / `x-opencode-project` keeps them untouched, and `projectHash` pins the project half for anonymous callers. Every forwarded request leaves one `/api/logs` line carrying the session id's head and tail and its injected/client origin, so rotation is observable. This redistributes identical total usage across more honest identities — and, with Tor lanes off, it deliberately stops there: caller IPs are never rotated by the identity layer. With `torEnabled` the exit really does change per lane (opt-in, see [Tor exit lanes](#tor-exit-lanes)); per-IP usage accounting still follows whatever address the request left from.
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `TOR=1` `TOR_LANES` `TOR_RACE_WIDTH` `TOR_COUNTRIES` `TOR_FALLBACK_COUNTRIES` `TOR_PREFERRED_COUNTRIES` `TOR_SWEEP_S` `TOR_SWEEP_MOVES` `TOR_EXIT_SOFT_CAP` `TOR_EXIT_HOLD_S` `TOR_ROUNDS` `TOR_STREAM_GRACE_S` `TOR_MAX_CIRCUIT_DIRTINESS` `TOR_BIN` `TOR_DATA_DIR` `TOR_DOWNLOAD=0` `TOR_PROOF=0` `TOR_STRICT_NODES=0` `ZEN_PROXY_CONFIG`
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>

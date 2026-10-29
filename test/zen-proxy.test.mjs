@@ -431,6 +431,55 @@ describe("identityFor", () => {
   })
 })
 
+describe("tor lane routing", () => {
+  const restore = () => zp.saveConfig({ torEnabled: false })
+
+  test("lanes off: no lane options and a plain fetch", async () => {
+    restore()
+    assert.deepEqual(zp.laneOpts(mockReq()), {})
+    let called = 0
+    const original = globalThis.fetch
+    globalThis.fetch = async () => {
+      called += 1
+      return new Response("ok", { status: 200 })
+    }
+    try {
+      const res = await zp.upstreamFetch("https://opencode.ai/x", { headers: {} })
+      assert.equal(res.status, 200)
+      assert.equal(called, 1, "with no hot lane the call is not raced")
+      assert.equal(zp.laneStatus().enabled, false)
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  test("a caller's own session is pinned to one lane, never fanned out", () => {
+    zp.saveConfig({ torEnabled: true })
+    try {
+      const opts = zp.laneOpts(mockReq({ headers: { "x-opencode-session": "ses_caller_owned" } }))
+      assert.equal(opts.identity, false)
+      assert.equal(opts.stickyKey, "ses_caller_owned")
+    } finally {
+      restore()
+    }
+  })
+
+  test("an anonymous caller races under per-lane identities", () => {
+    zp.saveConfig({ torEnabled: true })
+    try {
+      assert.deepEqual(zp.laneOpts(mockReq()), { identity: true })
+    } finally {
+      restore()
+    }
+  })
+
+  test("status reports lanes even before any manager exists", () => {
+    const status = zp.laneStatus()
+    assert.equal(typeof status.enabled, "boolean")
+    assert.equal(Array.isArray(status.lanes), true)
+  })
+})
+
 describe("retryableUpstream", () => {
   test("429 and 5xx are always retryable", () => {
     assert.equal(zp.retryableUpstream(429, {}), true)

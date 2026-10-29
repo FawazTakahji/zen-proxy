@@ -384,6 +384,15 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       </table>
       <div class="pager" id="reqPager"></div>
     </div>
+
+    <div class="panel" id="torPanel">
+      <h2><span class="hh">Tor exit lanes</span><span class="badge mut" id="torBadge">off</span></h2>
+      <p class="hint" id="torHint">Off. Enable them in Settings to spread free-tier usage across rotating Tor exits.</p>
+      <table id="torTable">
+        <thead><tr><th>Lane</th><th>State</th><th>Exit</th><th>Requests</th><th>Riding</th><th>Note</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </section>
 
   <section class="tab" id="tab-models">
@@ -443,6 +452,28 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgAutoUA"><span>Auto-track opencode releases &amp; update the User-Agent</span></div>
       <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
+      <div class="row" style="margin-top:26px"><span class="hh" style="font-family:var(--mono);font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase">Tor exit lanes</span></div>
+      <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. A call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
+      <div class="checkbox"><input type="checkbox" id="cfgTor"><span>Route upstream calls through Tor exit lanes</span></div>
+      <div class="formgrid">
+        <div>
+          <label>Lanes</label><input id="cfgTorLanes" type="number" min="1" max="64">
+          <label>Race width <span class="hint">(copies per call; 5 is measured)</span></label><input id="cfgTorRace" type="number" min="1" max="64">
+          <label>Countries <span class="hint">(comma-separated 2-letter codes)</span></label><input id="cfgTorCountries" type="text">
+          <label>Fallback countries</label><input id="cfgTorFallback" type="text">
+          <label>Preferred countries <span class="hint">(tried first)</span></label><input id="cfgTorPreferred" type="text">
+        </div>
+        <div>
+          <label>Exit soft cap <span class="hint">(leave before the daily 200 is spent)</span></label><input id="cfgTorSoftCap" type="number" min="1">
+          <label>Exit hold (seconds)</label><input id="cfgTorHold" type="number" min="30">
+          <label>Sweep interval (seconds)</label><input id="cfgTorSweep" type="number" min="5">
+          <label>Data dir <span class="hint">(empty = OS temp; restart to move)</span></label><input id="cfgTorDataDir" type="text">
+          <label>Tor binary <span class="hint">(empty = auto-detect/download)</span></label><input id="cfgTorBin" type="text">
+        </div>
+      </div>
+      <div class="checkbox"><input type="checkbox" id="cfgTorDownload"><span>Download the Tor Expert Bundle when no usable tor is found</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgTorProof"><span>Prove each lane's exit through <code>check.torproject.org</code></span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgTorStrict"><span>Strict exits (a lane dies rather than leave the requested country)</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgRateLimit"><span>Rate-limit chat requests per client (0 = off)</span></div>
       <div class="row" style="gap:10px;margin-top:6px">
         <div><label>Requests / window</label><input id="cfgRateMax" type="number" min="0" style="width:120px"></div>
@@ -546,6 +577,7 @@ async function refreshStatus() {
     $("ovModels").textContent = st.models.total
     $("ovAllowed").textContent = st.models.allowed + " allowed"
     if (document.getElementById("tab-overview").classList.contains("active")) renderTable(st.recent)
+    renderTor(st.lanes)
     hideBanner()
   } catch (e) {
     if (e.message !== "unauthorized") { $("upstreamDot").className = "dot bad"; $("upstreamText").textContent = "unreachable" }
@@ -583,6 +615,43 @@ function renderTable(recent) {
     <button onclick="pageTable(1)" ${tablePage >= pages ? "disabled" : ""}>next ›</button>`
 }
 function pageTable(d) { tablePage += d; refreshStatus() }
+
+function renderTor(info) {
+  const badge = $("torBadge"), hint = $("torHint"), tb = $("torTable").querySelector("tbody")
+  const lanes = (info && info.lanes) || []
+  const enabled = !!(info && info.enabled)
+  if (!enabled) {
+    badge.textContent = "off"
+    badge.className = "badge mut"
+    hint.textContent = "Off. Enable them in Settings to spread free-tier usage across rotating Tor exits."
+    tb.innerHTML = ""
+    return
+  }
+  const hot = info.hot || 0
+  badge.textContent = hot + "/" + (info.laneCount || lanes.length) + " hot"
+  badge.className = "badge " + (hot ? "ok" : info.error ? "bad" : "warn")
+  const bits = ["wave of " + (info.width || 1), (info.served || 0) + " served"]
+  if (info.error) bits.push(info.error)
+  else if (info.dataDir) bits.push("state in " + info.dataDir)
+  hint.textContent = bits.join(" · ")
+  if (!lanes.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="empty">no lanes yet — the first boot downloads tor and builds a circuit.</td></tr>'
+    return
+  }
+  tb.innerHTML = lanes.map((l) => {
+    const cls = l.state === "hot" ? "ok" : l.state === "dead" ? "bad" : l.state === "cold" ? "mut" : "warn"
+    const note = l.limited ? "exit is " + l.limited : (l.note || "")
+    const exit = l.exitIp ? escapeHtml(l.exitIp) : l.fingerprint ? escapeHtml(l.fingerprint.slice(0, 8)) : "—"
+    return `<tr>
+      <td class="mono">#${l.index} <span class="badge mut">${escapeHtml((l.country || "??").toUpperCase())}</span></td>
+      <td><span class="badge ${cls}">${escapeHtml(l.state)}</span></td>
+      <td class="mono">${exit}</td>
+      <td class="mono">${l.requests || 0}</td>
+      <td class="mono">${l.ridingS ? fmtUp(l.ridingS) : "—"}</td>
+      <td class="hint" style="margin:0">${escapeHtml(note)}</td>
+    </tr>`
+  }).join("")
+}
 
 async function refreshModels() {
   const cfg = await api("/api/config")
@@ -769,6 +838,20 @@ async function populateConfigForm() {
   $("cfgAutoUA").checked = config.autoUA !== false
   $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
   $("cfgInject").checked = config.injectSession !== false
+  $("cfgTor").checked = !!config.torEnabled
+  $("cfgTorLanes").value = config.torLanes ?? 10
+  $("cfgTorRace").value = config.torRaceWidth ?? 5
+  $("cfgTorCountries").value = config.torCountries ?? ""
+  $("cfgTorFallback").value = config.torFallbackCountries ?? ""
+  $("cfgTorPreferred").value = config.torPreferredCountries ?? ""
+  $("cfgTorSoftCap").value = config.torExitSoftCap ?? 100
+  $("cfgTorHold").value = config.torExitHoldS ?? 600
+  $("cfgTorSweep").value = config.torSweepS ?? 20
+  $("cfgTorDataDir").value = config.torDataDir ?? ""
+  $("cfgTorBin").value = config.torBinary ?? ""
+  $("cfgTorDownload").checked = config.torDownload !== false
+  $("cfgTorProof").checked = config.torProof !== false
+  $("cfgTorStrict").checked = config.torStrictNodes !== false
   $("cfgRateLimit").checked = Number(config.rateLimitMax) > 0
   $("cfgRateMax").value = config.rateLimitMax ?? 0
   $("cfgRateWindow").value = config.rateLimitWindowMs ?? 60000
@@ -805,6 +888,20 @@ async function saveConfig() {
     autoUA: $("cfgAutoUA").checked,
     uaRefreshMs: Number($("cfgUaMs").value || 21600000),
     injectSession: $("cfgInject").checked,
+    torEnabled: $("cfgTor").checked,
+    torLanes: Number($("cfgTorLanes").value || 10),
+    torRaceWidth: Number($("cfgTorRace").value || 5),
+    torCountries: $("cfgTorCountries").value.trim(),
+    torFallbackCountries: $("cfgTorFallback").value.trim(),
+    torPreferredCountries: $("cfgTorPreferred").value.trim(),
+    torExitSoftCap: Number($("cfgTorSoftCap").value || 100),
+    torExitHoldS: Number($("cfgTorHold").value || 600),
+    torSweepS: Number($("cfgTorSweep").value || 20),
+    torDataDir: $("cfgTorDataDir").value.trim(),
+    torBinary: $("cfgTorBin").value.trim(),
+    torDownload: $("cfgTorDownload").checked,
+    torProof: $("cfgTorProof").checked,
+    torStrictNodes: $("cfgTorStrict").checked,
     rateLimitMax: $("cfgRateLimit").checked ? Number($("cfgRateMax").value || 0) : 0,
     rateLimitWindowMs: Number($("cfgRateWindow").value || 60000),
   }

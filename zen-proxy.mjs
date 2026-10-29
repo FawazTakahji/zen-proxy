@@ -4,6 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto"
 import { fileURLToPath } from "node:url"
+import { createLanes, installExitHandler } from "./tor.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -351,6 +352,40 @@ const DEFAULT_CONFIG = {
   cacheMs: envNum("CACHE_MS", 30000),
   autoSync: ENV.AUTO_SYNC !== "0",
   autoSyncIntervalMs: envNum("AUTO_SYNC_MS", 3600000),
+  // ---- tor exit lanes ------------------------------------------------------
+  // Off by default. A lane is a tor process; a proxy that silently starts ten
+  // of them on first run is a surprise nobody asked for.
+  torEnabled: ENV.TOR === "1" || ENV.TOR === "true",
+  torLanes: envNum("TOR_LANES", 10),
+  // Five, not ten, and measured rather than shy: the free tier refuses a client
+  // it sees arrive from half a dozen addresses for the same session, and once it
+  // has refused, it refuses through every exit. Ten lanes still spread the day's
+  // allowance and give the sweep somewhere to move a lane. Ten copies of one
+  // call do not.
+  torRaceWidth: envNum("TOR_RACE_WIDTH", 5),
+  torCountries: ENV.TOR_COUNTRIES ?? "us,de,nl,fr,ro,gb,ca,se,pl,ch",
+  torFallbackCountries: ENV.TOR_FALLBACK_COUNTRIES ?? "",
+  torPreferredCountries: ENV.TOR_PREFERRED_COUNTRIES ?? "",
+  torSweepS: envNum("TOR_SWEEP_S", 20),
+  torSweepMoves: envNum("TOR_SWEEP_MOVES", 3),
+  // Half an exit's daily 200: leave before it is spent, because the only way to
+  // learn that somebody else spent it is to be refused.
+  torExitSoftCap: envNum("TOR_EXIT_SOFT_CAP", 100),
+  torExitHoldS: envNum("TOR_EXIT_HOLD_S", 600),
+  // How many times a call walks the pool when every lane answered with an error.
+  torRounds: envNum("TOR_ROUNDS", 2),
+  // A lane that just delivered a reply keeps its exit for this long, so the
+  // sweep cannot move it out from under a body that is still streaming.
+  torStreamGraceS: envNum("TOR_STREAM_GRACE_S", 120),
+  torBinary: ENV.TOR_BIN ?? "",
+  // Fetch the Tor Expert Bundle into the data dir when no usable tor is found
+  // on PATH. A system tor older than the current consensus protocol cannot be a
+  // client at all, so "found one" is not the same as "can use it".
+  torDownload: ENV.TOR_DOWNLOAD !== "0",
+  torDataDir: ENV.TOR_DATA_DIR ?? "",
+  torProof: ENV.TOR_PROOF !== "0",
+  torStrictNodes: ENV.TOR_STRICT_NODES !== "0",
+  torMaxCircuitDirtiness: envNum("TOR_MAX_CIRCUIT_DIRTINESS", 600),
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -1614,12 +1649,16 @@ async function handleMessages(req, res) {
       let upstreamRes
       const wall = isStream ? headersWall() : null
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-          method: "POST",
-          headers: zenHeaders(req, auth),
-          body: JSON.stringify(payload),
-          signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
-        })
+        upstreamRes = await upstreamFetch(
+          `${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`,
+          {
+            method: "POST",
+            headers: zenHeaders(req, auth),
+            body: JSON.stringify(payload),
+            signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
+          },
+          laneOpts(req),
+        )
         if (wall) wall.release()
       } catch (err) {
         if (wall) wall.release()
@@ -1863,12 +1902,16 @@ async function handleChat(req, res, responsesRoute = false) {
       let upstreamRes
       const wall = isStream ? headersWall() : null
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-          method: "POST",
-          headers: zenHeaders(req, auth),
-          body: JSON.stringify(payload),
-          signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
-        })
+        upstreamRes = await upstreamFetch(
+          `${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`,
+          {
+            method: "POST",
+            headers: zenHeaders(req, auth),
+            body: JSON.stringify(payload),
+            signal: isStream ? wall.signal : AbortSignal.timeout(config.timeoutMs),
+          },
+          laneOpts(req),
+        )
         if (wall) wall.release()
       } catch (err) {
         if (wall) wall.release()
@@ -2858,12 +2901,16 @@ async function probeModel(id, auth) {
     headers["x-session-id"] = session
   }
   if (config.tracing) for (const [k, v] of Object.entries(traceHeaders())) headers[k] = v
-  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(agentProbePayload(id, format)),
-    signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
-  })
+  const r = await upstreamFetch(
+    `${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(agentProbePayload(id, format)),
+      signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
+    },
+    { identity: true },
+  )
   // A live model answers the streamed probe with SSE, and sync only needs the
   // status. Hang up instead of waiting for the model to finish its "ping".
   if (r.ok) {
@@ -3354,10 +3401,14 @@ async function fetchModels() {
   if (modelsFetching) return modelsFetching
   modelsFetching = (async () => {
     try {
-      const res = await fetch(`${MODEL_LIST_BASE}/models`, {
-        headers: { "user-agent": config.ua },
-        signal: AbortSignal.timeout(15_000),
-      })
+      const res = await upstreamFetch(
+        `${MODEL_LIST_BASE}/models`,
+        {
+          headers: { "user-agent": config.ua },
+          signal: AbortSignal.timeout(15_000),
+        },
+        { identity: false },
+      )
       if (res.ok) {
         const parsed = await res.json()
         const upstreamModels = parsed.data ?? []
@@ -3392,10 +3443,14 @@ async function syncModels() {
   syncState.at = Date.now()
   const start = Date.now()
   try {
-    const res = await fetch(`${MODEL_LIST_BASE}/models`, {
-      headers: { "user-agent": config.ua },
-      signal: AbortSignal.timeout(15_000),
-    })
+    const res = await upstreamFetch(
+      `${MODEL_LIST_BASE}/models`,
+      {
+        headers: { "user-agent": config.ua },
+        signal: AbortSignal.timeout(15_000),
+      },
+      { identity: false },
+    )
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
@@ -3738,6 +3793,23 @@ async function handleApiConfig(req, res) {
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
+      cleaned.torEnabled = toBool(cleaned.torEnabled, config.torEnabled)
+      cleaned.torStrictNodes = toBool(cleaned.torStrictNodes, config.torStrictNodes)
+      cleaned.torProof = toBool(cleaned.torProof, config.torProof)
+      cleaned.torDownload = toBool(cleaned.torDownload, config.torDownload)
+      for (const key of [
+        "torLanes",
+        "torRaceWidth",
+        "torSweepS",
+        "torSweepMoves",
+        "torExitSoftCap",
+        "torExitHoldS",
+        "torRounds",
+        "torStreamGraceS",
+        "torMaxCircuitDirtiness",
+      ]) {
+        if (key in cleaned) cleaned[key] = Math.max(0, num(cleaned[key], config[key]))
+      }
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
@@ -3768,7 +3840,20 @@ async function handleApiConfig(req, res) {
       if (typeof cleaned.modelAliases !== "object" || cleaned.modelAliases === null) {
         cleaned.modelAliases = config.modelAliases
       }
+      const torWasEnabled = config.torEnabled
       saveConfig(cleaned)
+      // Toggling the lanes off has to do what it says: stop the tor children,
+      // not just stop routing to them. Turning them on starts the fleet on the
+      // next request (the boot is a background job, as at startup).
+      if (laneManagerRef) {
+        if (torWasEnabled && !config.torEnabled) {
+          laneManagerRef.stop()
+          log("tor lanes disabled — tor children stopped")
+        } else if (!torWasEnabled && config.torEnabled) {
+          log("tor lanes enabled — booting exits in the background")
+          activeLanes()
+        }
+      }
       scheduleSync()
       scheduleUA()
       log("config updated via UI")
@@ -3807,6 +3892,7 @@ async function handleStatus(req, res) {
     responsesModels: [...(config.responsesModels ?? [])],
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
     probeAuth: config.probeAuth ?? "auto",
+    lanes: laneStatus(),
     models: {
       total: cache.data.length,
       allowed: ALLOWED().size,
@@ -3835,6 +3921,83 @@ async function handleStatus(req, res) {
   })
 }
 
+// ---- tor lanes -------------------------------------------------------------
+// The manager keeps its own child processes and timers; nothing starts on
+// import, because a test that imports this module must never spawn tor.
+//
+// `laneConfig` is a live view of `config`: saveConfig() replaces the object
+// wholesale, so handing the manager the object itself would freeze every knob
+// at boot and a dashboard edit would never reach the running lanes.
+const laneConfig = new Proxy(
+  {},
+  {
+    get: (_target, key) => config[key],
+    has: () => true,
+  },
+)
+let laneManagerRef = null
+let laneStartPending = null
+
+function laneManager() {
+  if (!laneManagerRef) {
+    laneManagerRef = createLanes({
+      config: laneConfig,
+      log: (msg) => log(msg),
+      // The same generator the rest of the proxy uses, so a lane's identity is
+      // the CLI's own shape rather than a second dialect of it.
+      mintIdentity: () => ({ session: genSessionId().value, project: genProjectHash() }),
+    })
+    // A lane is a tor child process: however this process ends, it must not
+    // leave ten of them behind.
+    installExitHandler(laneManagerRef)
+  }
+  return laneManagerRef
+}
+
+/** The lanes, started on first use when enabled but not yet up. */
+function activeLanes() {
+  if (!config.torEnabled) return null
+  const manager = laneManager()
+  if (!manager.started && !laneStartPending) {
+    laneStartPending = manager.start().finally(() => {
+      laneStartPending = null
+    })
+  }
+  return manager
+}
+
+/**
+ * The one place upstream traffic leaves the proxy.
+ *
+ * Lanes off, or none hot yet: a plain fetch, exactly as before. Lanes hot: the
+ * call races — copies down `torRaceWidth` exits at once, the first 200 takes the
+ * client and the rest are cut before they say a word.
+ */
+function upstreamFetch(url, init, opts = {}) {
+  const manager = activeLanes()
+  if (!manager || !manager.hot) return fetch(url, init)
+  return manager.fetch(url, init, opts)
+}
+
+/**
+ * Lane options for one request.
+ *
+ * A caller that brought its own `x-opencode-session` keeps it: its identity is
+ * never rotated and it is pinned to a single lane, because racing one session
+ * from five addresses is exactly what earns 403 FreeTierError.
+ */
+function laneOpts(req) {
+  if (!config.torEnabled) return {}
+  const identity = identityFor(req)
+  if (identity.injected === false) return { identity: false, stickyKey: identity.session }
+  return { identity: true }
+}
+
+function laneStatus() {
+  if (!laneManagerRef) return { enabled: Boolean(config.torEnabled), started: false, hot: 0, lanes: [] }
+  return laneManagerRef.status()
+}
+
 function parseKey(key) {
   const [at, model, status] = key.split("|")
   return { at: Number(at), model, status: Number(status) }
@@ -3853,7 +4016,7 @@ async function handleTest(req, res) {
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
     const format = modelFormat(model)
-    const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: (() => {
         const h = {
@@ -3884,7 +4047,7 @@ async function handleTest(req, res) {
       // real client would get instead of a gate refusal it never earned.
       body: JSON.stringify(agentProbePayload(model, format)),
       signal: AbortSignal.timeout(config.timeoutMs),
-    })
+    }, { identity: true })
     if (upstreamRes.ok) {
       try { await upstreamRes.body?.cancel() } catch {}
     }
@@ -4124,6 +4287,15 @@ if (isMain) {
       log(`auto-sync enabled (every ${Math.round(config.autoSyncIntervalMs / 60000)} min) — probing free models…`)
       syncModels()
     }
+    if (config.torEnabled) {
+      log("tor lanes enabled — booting exits in the background")
+      laneManager()
+        .start()
+        .then((status) => {
+          if (!status.hot) log("tor: no lane came up — requests ride your own address")
+        })
+        .catch((err) => log(`tor: could not start lanes (${err.message})`))
+    }
     scheduleSync()
     scheduleUA()
   })
@@ -4132,6 +4304,10 @@ if (isMain) {
 export {
   isMain,
   config,
+  laneStatus,
+  laneManager,
+  upstreamFetch,
+  laneOpts,
   loadConfig,
   loadShippedModels,
   isFallbackModelsPinned,
