@@ -368,6 +368,10 @@ const DEFAULT_CONFIG = {
   // allowance and give the sweep somewhere to move a lane. Ten copies of one
   // call do not.
   torRaceWidth: envNum("TOR_RACE_WIDTH", 5),
+  // Sticky mode: ride one exit until the gate refuses it, then move on. The
+  // fleet is a reserve, not a race, so a working exit is never fanned out or
+  // rotated early and the rest of the day's allowances stay unspent.
+  torSticky: ENV.TOR_STICKY === "1" || ENV.TOR_STICKY === "true",
   torCountries: ENV.TOR_COUNTRIES ?? "us,de,nl,fr,ro,gb,ca,se,pl,ch",
   torFallbackCountries: ENV.TOR_FALLBACK_COUNTRIES ?? "",
   torPreferredCountries: ENV.TOR_PREFERRED_COUNTRIES ?? "",
@@ -3878,6 +3882,7 @@ async function handleApiConfig(req, res) {
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
       cleaned.overrideSession = toBool(cleaned.overrideSession, config.overrideSession)
       cleaned.torEnabled = toBool(cleaned.torEnabled, config.torEnabled)
+      cleaned.torSticky = toBool(cleaned.torSticky, config.torSticky)
       cleaned.torStrictNodes = toBool(cleaned.torStrictNodes, config.torStrictNodes)
       cleaned.torProof = toBool(cleaned.torProof, config.torProof)
       cleaned.torDownload = toBool(cleaned.torDownload, config.torDownload)
@@ -4054,9 +4059,10 @@ function activeLanes() {
 /**
  * The one place upstream traffic leaves the proxy.
  *
- * Lanes off, or none hot yet: a plain fetch, exactly as before. Lanes hot: the
- * call races — copies down `torRaceWidth` exits at once, the first 200 takes the
- * client and the rest are cut before they say a word.
+ * Lanes off: a plain fetch, exactly as before. Lanes hot: the call races —
+ * copies down `torRaceWidth` exits at once, the first 200 takes the client and
+ * the rest are cut before they say a word. With `torSticky` on, only one exit
+ * carries the call, and it is kept until the gate refuses it.
  */
 async function upstreamFetch(url, init, opts = {}) {
   // Tor on: every upstream call goes down a lane, even the first one before any
@@ -4091,7 +4097,15 @@ function laneOpts(req) {
 }
 
 function laneStatus() {
-  if (!laneManagerRef) return { enabled: Boolean(config.torEnabled), started: false, hot: 0, lanes: [] }
+  if (!laneManagerRef) {
+    return {
+      enabled: Boolean(config.torEnabled),
+      started: false,
+      sticky: Boolean(config.torSticky),
+      hot: 0,
+      lanes: [],
+    }
+  }
   return laneManagerRef.status()
 }
 

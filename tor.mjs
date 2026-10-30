@@ -748,6 +748,9 @@ export function createLanes(opts) {
   let torBinary = ""
   let served = 0
   let lastRace = null
+  // Sticky mode's current lane. -1 means "pick one"; a refused exit clears it
+  // so the next hot lane takes over.
+  let pinnedIndex = -1
 
   const laneCount = () => Math.max(1, Math.min(64, Number(config.torLanes) || 10))
   const raceWidth = () => Math.max(1, Math.min(64, Number(config.torRaceWidth) || 5))
@@ -1127,7 +1130,8 @@ export function createLanes(opts) {
         return status()
       }
       const count = laneCount()
-      log(`tor: starting ${count} lane(s), wave width ${raceWidth()}${config.torDataDir ? "" : ` (state in ${dataDir})`}`)
+      const mode = singleMode() ? "sticky, one exit at a time" : `wave width ${raceWidth()}`
+      log(`tor: starting ${count} lane(s), ${mode}${config.torDataDir ? "" : ` (state in ${dataDir})`}`)
       try {
         torBinary = await ensureTorBinary({
           dataDir,
@@ -1242,6 +1246,9 @@ export function createLanes(opts) {
         candidates.push({ lane, why: `exit is ${ledger.reasonFor(lane.fingerprint)}` })
         continue
       }
+      // Sticky mode keeps a working exit on purpose: neither the soft cap nor
+      // the hold window moves it. Only a refusal (above) or a dead lane does.
+      if (singleMode()) continue
       if (lane.requests >= softCap) candidates.push({ lane, why: `${lane.requests} requests on this exit` })
       else if (lane.ridingSince && now() - lane.ridingSince > holdS * 1000) {
         candidates.push({ lane, why: `riding this exit ${Math.round((now() - lane.ridingSince) / 1000)}s` })
@@ -1312,6 +1319,47 @@ export function createLanes(opts) {
     return ordered.slice(0, Math.min(width, ordered.length))
   }
 
+  // -------------------------------------------------------------------------
+  // sticky mode: one exit at a time
+  // -------------------------------------------------------------------------
+
+  /**
+   * Sticky mode trades breadth for conservation. The race spends five exits'
+   * allowances to get one answer; sticky mode keeps a single exit and rides it
+   * until the gate refuses it. Only then does the next hot lane take over, so
+   * the rest of the fleet stays unspent for later.
+   */
+  function singleMode() {
+    return Boolean(config.torSticky)
+  }
+
+  /**
+   * The one lane sticky mode is riding.
+   *
+   * Deliberately not "least loaded": two concurrent calls must share one exit,
+   * not each take a different one. The pin survives across calls while the exit
+   * is still welcome at the gate; a refusal clears it and the next hot lane
+   * (lowest index) becomes the new pin.
+   */
+  function pickSingleLane() {
+    const hot = hotLanes()
+    if (!hot.length) return null
+    const current = hot.find((lane) => lane.index === pinnedIndex)
+    if (current) return current
+    const next = [...hot].sort((a, b) => a.index - b.index)[0]
+    pinnedIndex = next.index
+    return next
+  }
+
+  /** Move one refused lane to a fresh exit, so a drained fleet refills. */
+  async function rotateOne() {
+    const lane = lanes.find(
+      (l) => l.state === "hot" && !l.active && l.fingerprint && ledger.limited(l.fingerprint),
+    )
+    if (!lane) return false
+    return moveLane(lane, `exit is ${ledger.reasonFor(lane.fingerprint)}`).catch(() => false)
+  }
+
   async function copyFetch(lane, url, init, headers) {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(new Error("lane timeout")), Number(config.timeoutMs) || 120_000)
@@ -1334,7 +1382,10 @@ export function createLanes(opts) {
       // exit is left early after torExitSoftCap calls, and the ledger keeps its
       // own lifetime row for picking the least-ridden relay.
       lane.requests += 1
-      lane.busyUntil = now() + (Number(config.torStreamGraceS) || 120) * 1000
+      // The grace window exists for a body that is still streaming to the
+      // client. A refusal is a verdict, not a stream, so it is free to rotate
+      // on the next sweep instead of sitting out the full grace.
+      if (res.status === 200) lane.busyUntil = now() + (Number(config.torStreamGraceS) || 120) * 1000
       return { res, controller }
     } catch (err) {
       clearTimeout(timeout)
@@ -1368,6 +1419,100 @@ export function createLanes(opts) {
   }
 
   /**
+   * One call, down one lane, kept until it is refused.
+   *
+   * The sticky-mode counterpart to the race: no copies, no fan-out. A refusal
+   * charges the exit, moves the pin to the next hot lane and retries — bounded
+   * by the same `torRetryMs` wall as the race. A caller-owned identity travels
+   * untouched (`opts.identity === false`); an anonymous call carries the lane's
+   * minted pair.
+   */
+  async function fetchSingle(url, init = {}, opts = {}) {
+    const persist = Boolean(started)
+    const retryMs = Number(opts.deadlineMs) || Number(config.torRetryMs) || Number(config.timeoutMs) || 120_000
+    const deadline = now() + retryMs
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+    // Without a live fleet (tests, pre-start) one pass over the pool is enough:
+    // a test must not hang waiting for a sweep that never runs.
+    let attemptsLeft = persist ? Infinity : Math.max(1, lanes.length)
+    let lastResponse = null
+    let lastThrow = null
+
+    while (persist ? now() < deadline : attemptsLeft-- > 0) {
+      const lane = pickSingleLane()
+      if (!lane) {
+        if (!persist) break
+        // Every exit is sitting out: rotate one back in and try it again.
+        const rotated = await rotateOne()
+        if (!rotated) await sleep(500)
+        continue
+      }
+      const headers = {
+        ...(init.headers || {}),
+        ...(opts.headers || {}),
+        ...(opts.identity === false ? {} : laneHeaders(lane)),
+      }
+      let res
+      try {
+        ;({ res } = await copyFetch(lane, url, init, headers))
+      } catch (err) {
+        // The caller's own wall cut the request: stop, and do not write the
+        // lane off for an abort that came from our side of the wire.
+        if (init?.signal?.aborted) throw err
+        lastThrow = err
+        ledger.note(lane.fingerprint, BLOCKED, now() + BLOCKED_COOLDOWN_MS)
+        log(`${lane.label} ${err.message} — trying another exit`)
+        pinnedIndex = -1
+        continue
+      }
+      if (res.status === 200) {
+        if (lastResponse) {
+          try {
+            await lastResponse.body?.cancel?.()
+          } catch {}
+        }
+        served += 1
+        lastRace = { at: now(), lanes: [lane.index], winner: lane.index, racers: 1 }
+        ledger.noteOk(lane.fingerprint)
+        return res
+      }
+      // Keep the newest refusal so the client still sees the far end's own words
+      // when no exit can serve the call.
+      if (lastResponse && lastResponse !== res) {
+        try {
+          await lastResponse.body?.cancel?.()
+        } catch {}
+      }
+      lastResponse = res
+      if (res.status === 429 || res.status === 403) {
+        const { text, retry } = await readVerdict(res)
+        const verdict = classifyFailure(res.status, text, retry, now())
+        if (verdict.edge) {
+          // The edge, not the exit: keep riding the same lane.
+          log(`429 OPENCODE EDGE UNAVAILABLE -- not ${lane.label}`)
+          continue
+        }
+        if (verdict.reason) {
+          ledger.note(lane.fingerprint, verdict.reason, verdict.until)
+          log(`${lane.label} ${res.status} ${verdict.reason} — moving to another exit`)
+        }
+        pinnedIndex = -1
+        continue
+      }
+      if (res.status >= 500) {
+        log(`${lane.label} ${res.status} — retrying on another exit`)
+        pinnedIndex = -1
+        continue
+      }
+      // Any other status (400, 404) is the caller's answer, not an exit problem.
+      return res
+    }
+
+    if (lastResponse) return lastResponse
+    throw lastThrow ?? new Error(lastError || "no lane could serve the call")
+  }
+
+  /**
    * One call, down a wave of lanes, first 200 wins.
    *
    * `opts.headers` is the head every copy carries; `opts.lanes` overrides the
@@ -1377,6 +1522,11 @@ export function createLanes(opts) {
    * words to the client.
    */
   async function fetchWithLanes(url, init = {}, opts = {}) {
+    // Sticky mode applies to every caller, including one that brought its own
+    // session: the whole point is that the proxy rides a single address, not a
+    // fleet. A caller-owned identity is still left untouched (opts.identity).
+    if (singleMode()) return fetchSingle(url, init, opts)
+
     const width = opts.lanes ?? raceWidth()
     // The old bound: walk the pool this many times before giving up. A live
     // fleet persists past it (below) until a lane wins or the caller's wall cuts
@@ -1591,7 +1741,9 @@ export function createLanes(opts) {
       started,
       laneCount: lanes.length,
       hot: hotLanes().length,
-      width: raceWidth(),
+      sticky: singleMode(),
+      pinned: pinnedIndex,
+      width: singleMode() ? 1 : raceWidth(),
       error: lastError,
       served,
       lastRace,
@@ -1625,6 +1777,7 @@ export function createLanes(opts) {
     started = false
     starting = null
     retryAt = 0
+    pinnedIndex = -1
     ledger.save()
   }
 
@@ -1646,6 +1799,7 @@ export function createLanes(opts) {
     // exposed for the tests and for `--tor-demo`
     classifyFailure,
     pickWave,
+    pickSingleLane,
   }
 }
 

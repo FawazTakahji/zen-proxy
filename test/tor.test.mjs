@@ -470,6 +470,96 @@ describe("the race", () => {
   })
 })
 
+describe("sticky mode", () => {
+  const softCap = Math.floor(EXIT_CAP / 2)
+
+  test("one lane carries every call until it is refused", async () => {
+    const lanes = [fakeLane(0, "0".repeat(40)), fakeLane(1, "1".repeat(40)), fakeLane(2, "2".repeat(40))]
+    const manager = makeManager({ lanes, config: { torSticky: true } })
+    const calls = stubPerLane({ 0: ok200, 1: ok200, 2: ok200 })
+    await manager.fetch("https://opencode.ai/x", { headers: {} }, {})
+    await manager.fetch("https://opencode.ai/x", { headers: {} }, {})
+    assert.deepEqual(
+      calls.map((c) => c.lane),
+      [0, 0],
+      "the same exit serves both calls instead of racing a wave",
+    )
+  })
+
+  test("a refused exit hands over to the next lane, which becomes the pin", async () => {
+    const lanes = [fakeLane(0, "0".repeat(40)), fakeLane(1, "1".repeat(40)), fakeLane(2, "2".repeat(40))]
+    const manager = makeManager({ lanes, config: { torSticky: true } })
+    const calls = stubPerLane({
+      0: () => new Response("Free usage limit reached", { status: 429 }),
+      1: ok200,
+      2: ok200,
+    })
+    const res = await manager.fetch("https://opencode.ai/x", { headers: {} }, {})
+    assert.equal(res.status, 200)
+    assert.deepEqual(
+      calls.map((c) => c.lane),
+      [0, 1],
+      "lane 0 was refused, lane 1 served",
+    )
+    assert.equal(manager.ledger.reasonFor("0".repeat(40)), FREE_LIMIT)
+    // The next call keeps riding lane 1, not the refused lane or a fresh race.
+    calls.length = 0
+    await manager.fetch("https://opencode.ai/x", { headers: {} }, {})
+    assert.deepEqual(
+      calls.map((c) => c.lane),
+      [1],
+    )
+  })
+
+  test("anonymous calls carry the lane identity; a caller-owned one is untouched", async () => {
+    const lanes = [fakeLane(0, "0".repeat(40))]
+    const manager = makeManager({ lanes, config: { torSticky: true } })
+    const calls = stubPerLane({ 0: ok200 })
+    await manager.fetch("https://opencode.ai/x", { headers: {} }, { identity: true })
+    assert.equal(calls[0].headers["x-opencode-session"], "ses_lane_0")
+    await manager.fetch(
+      "https://opencode.ai/x",
+      { headers: { "x-opencode-session": "ses_caller" } },
+      { identity: false, stickyKey: "ses_caller" },
+    )
+    assert.equal(calls[1].headers["x-opencode-session"], "ses_caller")
+  })
+
+  test("the sweep leaves a working lane alone in sticky mode", async () => {
+    const lane = fakeLane(0, "0".repeat(40), { requests: softCap })
+    const manager = makeManager({ lanes: [lane], config: { torSticky: true } })
+    let moved = 0
+    await manager.sweep({
+      moveLane: async () => {
+        moved += 1
+        return true
+      },
+    })
+    assert.equal(moved, 0, "a working exit is the whole point of the mode")
+  })
+
+  test("the sweep still moves a refused exit in sticky mode", async () => {
+    const lane = fakeLane(0, "0".repeat(40))
+    const manager = makeManager({ lanes: [lane], config: { torSticky: true } })
+    manager.ledger.note("0".repeat(40), FREE_LIMIT, Date.now() + 60_000)
+    let moved = 0
+    await manager.sweep({
+      moveLane: async () => {
+        moved += 1
+        return true
+      },
+    })
+    assert.equal(moved, 1)
+  })
+
+  test("status reports the mode and the single-lane width", () => {
+    const manager = makeManager({ lanes: [fakeLane(0, "0".repeat(40))], config: { torSticky: true } })
+    const status = manager.status()
+    assert.equal(status.sticky, true)
+    assert.equal(status.width, 1)
+  })
+})
+
 describe("lane selection", () => {
   test("the wave is the least-loaded lanes first", () => {
     const lanes = [

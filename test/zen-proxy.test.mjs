@@ -518,6 +518,26 @@ describe("tor lane routing", () => {
     assert.equal(typeof status.enabled, "boolean")
     assert.equal(Array.isArray(status.lanes), true)
   })
+
+  test("sticky mode is accepted and persisted through the config API", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(
+      mockReq({
+        method: "PUT",
+        url: "/api/config",
+        headers: { "content-type": "application/json" },
+        _body: JSON.stringify({ torSticky: true }),
+      }),
+      res,
+    )
+    try {
+      assert.equal(res.state.status, 200)
+      assert.equal(zp.config.torSticky, true)
+      assert.equal(JSON.parse(res.body).config.torSticky, true, "the dashboard reads the mode back")
+    } finally {
+      zp.saveConfig({ torSticky: false })
+    }
+  })
 })
 
 describe("retryableUpstream", () => {

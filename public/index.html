@@ -454,8 +454,9 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgOverride"><span>Override a client-supplied session/project with the proxy's own rotating pair</span></div>
       <div class="row" style="margin-top:26px"><span class="hh" style="font-family:var(--mono);font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase">Tor exit lanes</span></div>
-      <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. A call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
+      <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. By default a call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Sticky mode instead rides one exit until the gate refuses it, then moves to the next — it does not fan out, so the rest of the fleet's allowances stay unspent. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
       <div class="checkbox"><input type="checkbox" id="cfgTor"><span>Route upstream calls through Tor exit lanes</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgTorSticky"><span>Sticky mode — ride one exit until it is refused, then move on (don't exhaust the fleet)</span></div>
       <div class="formgrid">
         <div>
           <label>Lanes</label><input id="cfgTorLanes" type="number" min="1" max="64">
@@ -631,7 +632,10 @@ function renderTor(info) {
   const hot = info.hot || 0
   badge.textContent = hot + "/" + (info.laneCount || lanes.length) + " hot"
   badge.className = "badge " + (hot ? "ok" : info.error ? "bad" : "warn")
-  const bits = ["wave of " + (info.width || 1), (info.served || 0) + " served"]
+  const bits = [
+    info.sticky ? "sticky: one exit at a time" : "wave of " + (info.width || 1),
+    (info.served || 0) + " served",
+  ]
   if (info.error) bits.push(info.error)
   else if (info.dataDir) bits.push("state in " + info.dataDir)
   hint.textContent = bits.join(" · ")
@@ -841,6 +845,7 @@ async function populateConfigForm() {
   $("cfgInject").checked = config.injectSession !== false
   $("cfgOverride").checked = !!config.overrideSession
   $("cfgTor").checked = !!config.torEnabled
+  $("cfgTorSticky").checked = !!config.torSticky
   $("cfgTorLanes").value = config.torLanes ?? 10
   $("cfgTorRace").value = config.torRaceWidth ?? 5
   $("cfgTorCountries").value = config.torCountries ?? ""
@@ -892,6 +897,7 @@ async function saveConfig() {
     injectSession: $("cfgInject").checked,
     overrideSession: $("cfgOverride").checked,
     torEnabled: $("cfgTor").checked,
+    torSticky: $("cfgTorSticky").checked,
     torLanes: Number($("cfgTorLanes").value || 10),
     torRaceWidth: Number($("cfgTorRace").value || 5),
     torCountries: $("cfgTorCountries").value.trim(),
