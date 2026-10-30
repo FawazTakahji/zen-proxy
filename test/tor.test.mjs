@@ -690,7 +690,46 @@ describe("tor binary resolution", () => {
     const exe = path.join(dir, "tools", "tor", process.platform === "win32" ? "tor.exe" : "tor")
     fs.mkdirSync(path.dirname(exe), { recursive: true })
     fs.writeFileSync(exe, "x")
-    assert.equal(await ensureTorBinary({ dataDir: dir, download: false }), exe)
+    assert.equal(
+      await ensureTorBinary({ dataDir: dir, download: false, versionOf: async () => ({ major: 0, minor: 4, patch: 9 }) }),
+      exe,
+    )
+  })
+
+  test("a stale tor on PATH is refused, never returned", async () => {
+    const exe = process.platform === "win32" ? "tor.exe" : "tor"
+    const staleDir = path.join(dir, "stale")
+    fs.mkdirSync(staleDir, { recursive: true })
+    fs.writeFileSync(path.join(staleDir, exe), "x")
+    const originalPath = process.env.PATH
+    process.env.PATH = staleDir
+    try {
+      await assert.rejects(
+        () => ensureTorBinary({ dataDir: dir, download: false, versionOf: async () => ({ major: 0, minor: 4, patch: 7 }) }),
+        /no usable tor found/,
+      )
+    } finally {
+      process.env.PATH = originalPath
+    }
+  })
+
+  test("a stale bundled tor is skipped too, so a fresher PATH tor wins", async () => {
+    const exe = process.platform === "win32" ? "tor.exe" : "tor"
+    const bundled = path.join(dir, "tools", "tor", exe)
+    const onPath = path.join(dir, "good", exe)
+    for (const p of [bundled, onPath]) {
+      fs.mkdirSync(path.dirname(p), { recursive: true })
+      fs.writeFileSync(p, "x")
+    }
+    const versionOf = async (bin) =>
+      bin === onPath ? { major: 0, minor: 4, patch: 9 } : { major: 0, minor: 4, patch: 7 }
+    const originalPath = process.env.PATH
+    process.env.PATH = path.dirname(onPath)
+    try {
+      assert.equal(await ensureTorBinary({ dataDir: dir, download: false, versionOf }), onPath)
+    } finally {
+      process.env.PATH = originalPath
+    }
   })
 
   test("with no tor anywhere and downloads off, it says so instead of guessing", async () => {
@@ -699,7 +738,7 @@ describe("tor binary resolution", () => {
     try {
       await assert.rejects(
         () => ensureTorBinary({ dataDir: dir, download: false }),
-        /no tor found on PATH/,
+        /no usable tor found/,
       )
     } finally {
       process.env.PATH = originalPath

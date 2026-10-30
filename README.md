@@ -161,6 +161,8 @@ TOR=1 TOR_LANES=10 TOR_RACE_WIDTH=5 bun zen-proxy.mjs
 How it behaves:
 
 - **Ten lanes, five wide.** Each lane is its own `tor` process in its own data directory, pinned to a distinct exit relay. A model call is sent down **five** lanes at once; the first `200` takes the client and the rest are cut before they say a word. Five is measured, not shy: the gate refuses a client it sees arrive from half a dozen addresses for one session (`403 FreeTierError`), and once refused, refuses it through every exit. Ten lanes still spread the day's allowance.
+- **Exits are spread across countries.** Lanes are no longer all drawn from the first country in the pool (which used to crowd the busiest shared exits). Every pick is a uniform choice among the least-used relays *across* the whole country list, so the fleet lands in many countries/ASes instead of one.
+- **A live fleet keeps trying until a lane wins.** When every lane in a wave is refused, their exits are rotated to fresh relays and the call retries — bounded by `torRetryMs` (and by the request's own timeout), not by a fixed two walks of the pool. The proxy never falls back to your own address while Tor is on: if the fleet is still booting or can't come up, the request waits (or fails) rather than leaking out direct.
 - **Refusals are charged per exit.** A `429 FreeUsageLimitError` sits that exit out until 00:00 UTC, a burst `429` for ~25 minutes, a gate `403` for 5 minutes. A spent exit is skipped by the race and the sweep moves its lane to a fresh relay.
 - **Exits are left before they are spent.** After `torExitSoftCap` requests (100, half the daily wall) or `torExitHoldS` seconds (600), a lane moves to another relay — the only way to learn somebody else spent an exit's allowance is to be refused.
 - **One lane, one identity.** Each lane mints its own session + project pair and rotates it with the exit. A caller that brings its own `x-opencode-session` is the exception: it is pinned to a single lane and its identity is never touched, because racing one session from five addresses is what earns the 403. Set `overrideSession` if you want such a client (an OpenCode client pointed at the proxy, say) to race under lane-minted identities instead.
@@ -169,7 +171,7 @@ How it behaves:
 Two requirements and one warning:
 
 - **Bun.** Node's `fetch` accepts a `proxy` option and silently ignores it, so lanes refuse to start under Node and log why ("tor lanes need Bun"). BYOK still works on Node without lanes.
-- **A tor binary.** The first enabled run downloads the Tor Expert Bundle (~30 MB, once) into `torDataDir` (default: the OS temp directory). A usable `tor` on `PATH`, or `torBinary`, is used instead. A stale system tor (0.4.7 and older) cannot join the current network; the bundle exists for that reason.
+- **A tor binary.** The first enabled run downloads the Tor Expert Bundle (~30 MB, once) into `torDataDir` (default: the OS temp directory). A `tor` on `PATH` is only used if it is 0.4.8 or newer (checked via `tor --version`); a stale system tor — 0.4.7 and older, which cannot join the current network — is detected and skipped, so the bundle is downloaded instead. An explicit `torBinary` always wins, unchecked.
 - **Tor is slow and shared.** Racing five copies multiplies upstream load and adds latency, and public exits are used by everyone. This is a way to keep working when one address hits a wall, not a way to evade a ban. The ledger lives in `torDataDir/tor-ledger.json`; delete it to forget every verdict.
 
 | Key | Default | Description |
@@ -178,7 +180,7 @@ Two requirements and one warning:
 | `torLanes` / `torRaceWidth` | `10` / `5` | Tor processes / copies per call. Both are clamped to 1–64 |
 | `torCountries` / `torFallbackCountries` / `torPreferredCountries` | `us,de,nl,fr,ro,gb,ca,se,pl,ch` / `""` / `""` | Comma-separated two-letter exit countries; preferred are tried first, fallback when the main pool has no headroom |
 | `torExitSoftCap` / `torExitHoldS` / `torSweepS` | `100` / `600` / `20` | Leave an exit after this many requests or seconds; how often the sweep looks |
-| `torSweepMoves` / `torRounds` / `torStreamGraceS` | `3` / `2` / `120` | Lanes moved per sweep; pool walks when every lane fails; quiet period after a reply so a body can finish |
+| `torSweepMoves` / `torRounds` / `torRetryMs` / `torStreamGraceS` | `3` / `2` / `120000` / `120` | Lanes moved per sweep; initial pool walks when every lane fails; how long a live fleet keeps rotating exits before giving up; quiet period after a reply so a body can finish |
 | `torDataDir` / `torBinary` | `""` / `""` | State (lanes, ledger, tor bundle) and an explicit tor path. Moving the data dir needs a restart |
 | `torDownload` / `torProof` / `torStrictNodes` / `torMaxCircuitDirtiness` | `true` / `true` / `true` / `600` | Download the bundle when needed; prove each exit through `check.torproject.org`; refuse a fallback outside the pinned relay; circuit rotation window |
 

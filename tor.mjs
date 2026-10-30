@@ -35,7 +35,7 @@
 // being raced from five addresses. That is the same rule lingling follows by
 // never touching a session id — just enforced by not fanning it out.
 
-import { spawn } from "node:child_process"
+import { spawn, execFile } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import fs from "node:fs"
 import net from "node:net"
@@ -447,22 +447,66 @@ export function geoipFor(torBinary) {
  * consensus protocol and refuses to be a client at all — which is exactly why
  * the download exists rather than trusting PATH.
  */
-export async function ensureTorBinary({ dataDir, override = "", download = true, log = () => {} } = {}) {
+/**
+ * The oldest tor that can still join today's network. The current consensus
+ * requires protocol versions (Desc=3, Microdesc=3) that 0.4.7 and older do not
+ * speak — they start, write a cookie, open a control port, and then sit at 0%
+ * forever. A tor that old is a trap, not a tor, so auto-discovery refuses it and
+ * falls through to the bundle.
+ */
+function parseTorVersion(out) {
+  const m = /Tor version ([0-9]+)\.([0-9]+)\.([0-9]+)/.exec(String(out))
+  if (!m) return null
+  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) }
+}
+
+function versionAtLeast(v, major, minor, patch) {
+  if (!v) return false
+  if (v.major !== major) return v.major > major
+  if (v.minor !== minor) return v.minor > minor
+  return v.patch >= patch
+}
+
+/** `tor --version`, or null when it cannot run / does not report a version. */
+function torVersion(binPath) {
+  return new Promise((resolve) => {
+    execFile(binPath, ["--version"], { timeout: 10_000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(null)
+      resolve(parseTorVersion(stdout))
+    })
+  })
+}
+
+export async function ensureTorBinary({ dataDir, override = "", download = true, log = () => {}, versionOf = torVersion } = {}) {
   const exe = process.platform === "win32" ? "tor.exe" : "tor"
   if (override) {
+    // An explicit override wins because the operator said so — the version gate
+    // is for auto-discovery only, where a stale tor is indistinguishable from
+    // "tor is installed".
     if (!fs.existsSync(override)) throw new Error(`torBinary not found: ${override}`)
     return override
   }
+  // A candidate is usable only if its reported version can speak the current
+  // consensus protocol; a too-old or silent tor is skipped, never returned.
+  const usable = async (bin) => {
+    if (!bin) return ""
+    const v = await versionOf(bin)
+    if (versionAtLeast(v, 0, 4, 8)) return bin
+    log(
+      `tor: ${bin} is ${v ? `tor ${v.major}.${v.minor}.${v.patch}` : "unrecognised"} — too old for today's network; looking for a fresher tor`,
+    )
+    return ""
+  }
   const toolsDir = path.join(dataDir, "tools")
-  const bundled = findTorUnder(toolsDir, exe)
+  const bundled = await usable(findTorUnder(toolsDir, exe))
   if (bundled) return bundled
-  const onPath = findOnPath(exe)
+  const onPath = await usable(findOnPath(exe))
   if (onPath) return onPath
-  if (!download) throw new Error(`no tor found on PATH; set TOR_BIN or a "torBinary" in the config`)
+  if (!download) throw new Error(`no usable tor found (need >= 0.4.8); set TOR_BIN or a "torBinary" in the config`)
   await downloadTorBundle({ toolsDir, log })
-  const located = findTorUnder(toolsDir, exe)
+  const located = await usable(findTorUnder(toolsDir, exe))
   if (!located) {
-    throw new Error("the Tor bundle downloaded but no tor binary was found inside it")
+    throw new Error("the Tor bundle downloaded but no usable tor binary was found inside it")
   }
   return located
 }
@@ -766,23 +810,31 @@ export function createLanes(opts) {
       ? [country, ...pools.preferred, ...pools.primary, ...pools.fallback]
       : [...pools.preferred, ...pools.primary, ...pools.fallback]
     const seen = new Set()
+    // Collect candidates from every country, not just the first one with a
+    // relay: lanes spread across the pool instead of piling onto one country.
+    const all = []
     for (const cc of order) {
       if (seen.has(cc)) continue
       seen.add(cc)
-      const candidates = usable(cc)
-      if (!candidates.length) continue
-      // Least-ridden first: a relay this session has never touched beats one it
-      // left ten minutes ago, and among equals the alphabetical order keeps the
-      // pick reproducible.
-      candidates.sort((a, b) => {
-        const ua = ledger.usageFor(a.fingerprint).requests
-        const ub = ledger.usageFor(b.fingerprint).requests
-        if (ua !== ub) return ua - ub
-        return a.fingerprint.localeCompare(b.fingerprint)
-      })
-      return { ...candidates[0], country: cc }
+      for (const relay of usable(cc)) all.push({ relay, country: cc })
     }
-    return null
+    if (!all.length) return null
+    // Least-ridden first: a relay this session has never touched beats one it
+    // left ten minutes ago, and among equals the alphabetical order keeps the
+    // pick reproducible.
+    all.sort((a, b) => {
+      const ua = ledger.usageFor(a.relay.fingerprint).requests
+      const ub = ledger.usageFor(b.relay.fingerprint).requests
+      if (ua !== ub) return ua - ub
+      return a.relay.fingerprint.localeCompare(b.relay.fingerprint)
+    })
+    // A uniform pick among the least-used tier: fresh relays across many
+    // countries get an even chance, so the fleet does not crowd the most common
+    // exit pool (the busiest relays are the most shared, hence the most spent).
+    const min = ledger.usageFor(all[0].relay.fingerprint).requests
+    const fresh = all.filter((x) => ledger.usageFor(x.relay.fingerprint).requests === min)
+    const chosen = fresh[Math.floor(Math.random() * fresh.length)]
+    return { ...chosen.relay, country: chosen.country }
   }
 
   // -------------------------------------------------------------------------
@@ -1069,7 +1121,7 @@ export function createLanes(opts) {
       // nothing. Refusing loudly is the only honest outcome.
       if (typeof Bun === "undefined") {
         lastError = "tor lanes need Bun — Node's fetch ignores the per-lane proxy"
-        log(`tor: ${lastError}; lanes stay off, requests ride your own address`)
+        log(`tor: ${lastError}; lanes stay off — requests fail rather than ride your own address`)
         retryAt = now() + 3600_000
         starting = null
         return status()
@@ -1086,7 +1138,7 @@ export function createLanes(opts) {
         log(`tor: using ${torBinary}`)
       } catch (err) {
         lastError = `no usable tor: ${err.message}`
-        log(`tor: ${lastError} — lanes stay off, requests ride your own address`)
+        log(`tor: ${lastError} — lanes stay off — requests fail rather than ride your own address`)
         retryAt = now() + 60_000
         starting = null
         return status()
@@ -1095,7 +1147,7 @@ export function createLanes(opts) {
         await loadConsensus()
       } catch (err) {
         lastError = `exit discovery failed: ${err.message}`
-        log(`tor: ${lastError} — lanes stay off, requests ride your own address`)
+        log(`tor: ${lastError} — lanes stay off — requests fail rather than ride your own address`)
         retryAt = now() + 60_000
         starting = null
         return status()
@@ -1326,32 +1378,90 @@ export function createLanes(opts) {
    */
   async function fetchWithLanes(url, init = {}, opts = {}) {
     const width = opts.lanes ?? raceWidth()
+    // The old bound: walk the pool this many times before giving up. A live
+    // fleet persists past it (below) until a lane wins or the caller's wall cuts
+    // in — "keep trying exits until one works".
     const rounds = Math.max(1, Number(opts.rounds ?? config.torRounds) || 2)
+    // Persistence means rotating refused exits and trying again, and it only
+    // makes sense against a live fleet. Before start — and under the tests'
+    // fake lanes — the bounded walk keeps a request from hanging forever.
+    const persist = Boolean(started)
+    const retryMs = Number(opts.deadlineMs) || Number(config.torRetryMs) || Number(config.timeoutMs) || 120_000
+    const deadline = now() + (persist ? retryMs : rounds * (Number(config.timeoutMs) || 120_000))
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
     const sticky = opts.stickyKey ? stickyLane(opts.stickyKey) : null
+
+    // Move refused lanes to fresh exits. `only` narrows it to the lanes a call
+    // just charged; without it, every limited lane rotates. Returns whether
+    // anything moved, so a caller can tell progress from a stall.
+    async function rotateRefused(only = null) {
+      const candidates = (only ?? lanes).filter(
+        (lane) =>
+          lane &&
+          lane.state === "hot" &&
+          !lane.active &&
+          (lane.fingerprint ? ledger.limited(lane.fingerprint) : false),
+      )
+      if (!candidates.length) return false
+      await Promise.all(
+        candidates.map((lane) =>
+          moveLane(lane, `exit is ${ledger.reasonFor(lane.fingerprint)}`).catch(() => false),
+        ),
+      )
+      return true
+    }
+
     if (opts.stickyKey) {
-      // A caller that brought its own session gets one lane, not a fleet.
-      if (!sticky) return fetch(url, init)
-      const { res } = await copyFetch(sticky, url, init, { ...(init.headers || {}), ...(opts.headers || {}) })
-      if (res.status === 429 || res.status === 403) {
-        // Charge the verdict even though there was no race: the next call then
-        // hashes onto a lane that is still welcome at the gate.
-        const { text, retry } = await readVerdict(res)
-        const verdict = classifyFailure(res.status, text, retry, now())
-        if (verdict.reason) {
-          ledger.note(sticky.fingerprint, verdict.reason, verdict.until)
-          log(`${sticky.label} ${res.status} ${verdict.reason} — sitting it out`)
+      // A caller that brought its own session gets one lane, never a fleet, and
+      // never the device network. If that lane is spent (or not up yet), wait for
+      // a healthy one and re-pin the session to it.
+      let lane = sticky
+      while (persist ? now() < deadline : true) {
+        if (!lane) lane = stickyLane(opts.stickyKey)
+        if (!lane) {
+          if (!persist) return fetch(url, init) // tests / pre-start: old behaviour
+          await sleep(1000)
+          continue
         }
+        const { res } = await copyFetch(lane, url, init, { ...(init.headers || {}), ...(opts.headers || {}) })
+        if (res.status === 429 || res.status === 403) {
+          // Charge the verdict even though there was no race: the next call then
+          // hashes onto a lane that is still welcome at the gate.
+          const { text, retry } = await readVerdict(res)
+          const verdict = classifyFailure(res.status, text, retry, now())
+          if (verdict.reason) {
+            ledger.note(lane.fingerprint, verdict.reason, verdict.until)
+            log(`${lane.label} ${res.status} ${verdict.reason} — ${persist ? "moving it" : "sitting it out"}`)
+          }
+          if (persist && now() < deadline) {
+            try {
+              await moveLane(lane, `exit is ${verdict.reason || "refused"}`)
+            } catch {}
+            lane = null
+            continue
+          }
+        }
+        return res
       }
-      return res
+      throw new Error("no tor lane could serve a sticky session in time")
     }
 
     let lastResponse = null
-    let lastError = null
+    let lastThrow = null
     const tried = new Set()
+    let round = 0
 
-    for (let round = 0; round < rounds; round += 1) {
+    while (persist ? now() < deadline : round < rounds) {
+      round += 1
       const wave = pickWave(width).filter((lane) => !tried.has(lane.index))
-      if (!wave.length) break
+      if (!wave.length) {
+        if (!persist) break
+        // Nothing hot and un-tried: rotate the refused pool and keep going.
+        tried.clear()
+        const rotated = await rotateRefused()
+        if (!rotated) await sleep(1000)
+        continue
+      }
       // Each copy gets its own cut switch, so a loser can be hung up the moment
       // somebody else wins — a losing copy downloading a whole answer spends an
       // exit's daily 200 for nothing.
@@ -1388,7 +1498,7 @@ export function createLanes(opts) {
           attempt.then(async (result) => {
             settled += 1
             if (result.error) {
-              lastError = result.error
+              lastThrow = result.error
               // A copy that never got an answer is the exit's problem until
               // proven otherwise: write the address off briefly and let the
               // sweep move the lane. The lane itself stays hot.
@@ -1460,10 +1570,15 @@ export function createLanes(opts) {
           } catch {}
         }
       }
+      if (persist) {
+        // Rotate the refused exits so the next pass starts from fresh addresses.
+        for (const result of losers) tried.delete(result.lane.index)
+        await rotateRefused(losers.map((r) => r.lane))
+      }
     }
 
     if (lastResponse) return lastResponse
-    throw lastError ?? new Error("no lane could serve the call")
+    throw lastThrow ?? new Error(lastError || "no lane could serve the call")
   }
 
   // -------------------------------------------------------------------------

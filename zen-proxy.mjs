@@ -379,6 +379,9 @@ const DEFAULT_CONFIG = {
   torExitHoldS: envNum("TOR_EXIT_HOLD_S", 600),
   // How many times a call walks the pool when every lane answered with an error.
   torRounds: envNum("TOR_ROUNDS", 2),
+  // A live fleet keeps rotating exits until a lane wins, bounded by this wall
+  // (the request's own timeout is the ceiling in practice).
+  torRetryMs: envNum("TOR_RETRY_MS", 120000),
   // A lane that just delivered a reply keeps its exit for this long, so the
   // sweep cannot move it out from under a body that is still streaming.
   torStreamGraceS: envNum("TOR_STREAM_GRACE_S", 120),
@@ -3825,6 +3828,7 @@ async function handleApiConfig(req, res) {
         "torExitSoftCap",
         "torExitHoldS",
         "torRounds",
+        "torRetryMs",
         "torStreamGraceS",
         "torMaxCircuitDirtiness",
       ]) {
@@ -3993,9 +3997,19 @@ function activeLanes() {
  * call races — copies down `torRaceWidth` exits at once, the first 200 takes the
  * client and the rest are cut before they say a word.
  */
-function upstreamFetch(url, init, opts = {}) {
+async function upstreamFetch(url, init, opts = {}) {
+  // Tor on: every upstream call goes down a lane, even the first one before any
+  // lane is hot — never the device's own address. Tor off: a plain fetch.
+  if (!config.torEnabled) return fetch(url, init)
   const manager = activeLanes()
-  if (!manager || !manager.hot) return fetch(url, init)
+  if (!manager.started) {
+    // Wait for the fleet to come up (activeLanes() already kicked start() off).
+    // start() reports its own failure in status().error; fetchWithLanes surfaces
+    // it instead of silently falling back to the device network.
+    try {
+      await manager.start()
+    } catch {}
+  }
   return manager.fetch(url, init, opts)
 }
 
