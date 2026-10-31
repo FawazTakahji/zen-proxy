@@ -718,6 +718,7 @@ class Lane {
  * @param {object} opts.config       the proxy's live config object (read, never written)
  * @param {(msg: string) => void} [opts.log]
  * @param {() => {session: string, project: string}} [opts.mintIdentity]
+ * @param {() => {b3?: string, traceparent?: string}} [opts.mintTrace]  fresh trace identity for per-attempt rotation
  * @param {number} [opts.basePort]   first port a lane may use (tunnel/control pairs)
  */
 export function createLanes(opts) {
@@ -729,6 +730,11 @@ export function createLanes(opts) {
       session: `ses_${randomBytes(19).toString("hex").slice(0, 32)}`,
       project: randomBytes(20).toString("hex"),
     }))
+  // A wholly fresh trace identity per attempt. Absent by default: the proxy's
+  // own trace headers (one stable per-process root, like the CLI) ride through.
+  // `torRotateIdentity` supplies this so each attempt can present a brand-new
+  // process identity instead of sharing the proxy's b3/traceparent root.
+  const mintTrace = opts.mintTrace ?? (() => ({}))
   const now = opts.now ?? (() => Date.now())
   const basePort = opts.basePort ?? 19050
 
@@ -1273,15 +1279,24 @@ export function createLanes(opts) {
   // the race
   // -------------------------------------------------------------------------
 
-  function laneHeaders(lane) {
-    const identity = lane.identity ?? mintForLane(lane)
-    return {
+  function rotateIdentity() {
+    return Boolean(config.torRotateIdentity)
+  }
+
+  function laneHeaders(lane, { rotate = false } = {}) {
+    // Per-attempt rotation mints a brand-new session + project + trace root, so
+    // a flagged identity never rides a fresh exit. Without it the lane's stable
+    // pair is reused — cheaper, but a refused pair follows the lane everywhere.
+    const identity = rotate ? mint() : (lane.identity ?? mintForLane(lane))
+    const headers = {
       "x-opencode-session": identity.session,
       "x-opencode-session-id": identity.session,
       "x-session-affinity": identity.session,
       "x-session-id": identity.session,
       "x-opencode-project": identity.project,
     }
+    if (rotate) Object.assign(headers, mintTrace())
+    return headers
   }
 
   /** Stable lane for a caller-owned session: never fan one session across exits. */
@@ -1450,7 +1465,7 @@ export function createLanes(opts) {
       const headers = {
         ...(init.headers || {}),
         ...(opts.headers || {}),
-        ...(opts.identity === false ? {} : laneHeaders(lane)),
+        ...(opts.identity === false ? {} : laneHeaders(lane, { rotate: rotateIdentity() })),
       }
       let res
       try {
@@ -1624,7 +1639,7 @@ export function createLanes(opts) {
         const headers = {
           ...(init.headers || {}),
           ...(opts.headers || {}),
-          ...(opts.identity === false ? {} : laneHeaders(lane)),
+          ...(opts.identity === false ? {} : laneHeaders(lane, { rotate: rotateIdentity() })),
         }
         const copyInit = init?.signal
           ? { ...init, signal: AbortSignal.any ? AbortSignal.any([init.signal, cut.signal]) : cut.signal }
@@ -1743,6 +1758,7 @@ export function createLanes(opts) {
       hot: hotLanes().length,
       sticky: singleMode(),
       pinned: pinnedIndex,
+      rotateIdentity: rotateIdentity(),
       width: singleMode() ? 1 : raceWidth(),
       error: lastError,
       served,

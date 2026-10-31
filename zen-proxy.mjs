@@ -372,6 +372,11 @@ const DEFAULT_CONFIG = {
   // fleet is a reserve, not a race, so a working exit is never fanned out or
   // rotated early and the rest of the day's allowances stay unspent.
   torSticky: ENV.TOR_STICKY === "1" || ENV.TOR_STICKY === "true",
+  // Per-attempt identity rotation: mint a fresh session + project + trace root
+  // for every lane attempt, so a flagged identity never follows onto a fresh
+  // exit. Off by default — a lane reuses its minted pair and the process keeps
+  // one trace root, which is the CLI's own shape (and cheaper).
+  torRotateIdentity: ENV.TOR_ROTATE_IDENTITY === "1" || ENV.TOR_ROTATE_IDENTITY === "true",
   torCountries: ENV.TOR_COUNTRIES ?? "us,de,nl,fr,ro,gb,ca,se,pl,ch",
   torFallbackCountries: ENV.TOR_FALLBACK_COUNTRIES ?? "",
   torPreferredCountries: ENV.TOR_PREFERRED_COUNTRIES ?? "",
@@ -1437,6 +1442,19 @@ function traceHeaders() {
   return {
     b3: `${traceRoot}-${span}-1-${parent}`,
     traceparent: `00-${traceRoot}-${span}-01`,
+  }
+}
+
+// A wholly fresh trace identity, used for per-attempt rotation. Unlike
+// `traceHeaders()` (one stable root per process, like the CLI), this mints a
+// new root every call so consecutive attempts do not correlate on b3/traceparent.
+function mintTrace() {
+  const root = randomBytes(16).toString("hex")
+  const span = randomBytes(8).toString("hex")
+  const parent = randomBytes(8).toString("hex")
+  return {
+    b3: `${root}-${span}-1-${parent}`,
+    traceparent: `00-${root}-${span}-01`,
   }
 }
 
@@ -3883,6 +3901,7 @@ async function handleApiConfig(req, res) {
       cleaned.overrideSession = toBool(cleaned.overrideSession, config.overrideSession)
       cleaned.torEnabled = toBool(cleaned.torEnabled, config.torEnabled)
       cleaned.torSticky = toBool(cleaned.torSticky, config.torSticky)
+      cleaned.torRotateIdentity = toBool(cleaned.torRotateIdentity, config.torRotateIdentity)
       cleaned.torStrictNodes = toBool(cleaned.torStrictNodes, config.torStrictNodes)
       cleaned.torProof = toBool(cleaned.torProof, config.torProof)
       cleaned.torDownload = toBool(cleaned.torDownload, config.torDownload)
@@ -4036,6 +4055,7 @@ function laneManager() {
       // The same generator the rest of the proxy uses, so a lane's identity is
       // the CLI's own shape rather than a second dialect of it.
       mintIdentity: () => ({ session: genSessionId().value, project: genProjectHash() }),
+      mintTrace: () => mintTrace(),
     })
     // A lane is a tor child process: however this process ends, it must not
     // leave ten of them behind.

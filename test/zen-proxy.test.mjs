@@ -538,6 +538,26 @@ describe("tor lane routing", () => {
       zp.saveConfig({ torSticky: false })
     }
   })
+
+  test("identity rotation is accepted and persisted through the config API", async () => {
+    const res = mockRes()
+    await zp.handleApiConfig(
+      mockReq({
+        method: "PUT",
+        url: "/api/config",
+        headers: { "content-type": "application/json" },
+        _body: JSON.stringify({ torRotateIdentity: true }),
+      }),
+      res,
+    )
+    try {
+      assert.equal(res.state.status, 200)
+      assert.equal(zp.config.torRotateIdentity, true)
+      assert.equal(JSON.parse(res.body).config.torRotateIdentity, true, "the dashboard reads the toggle back")
+    } finally {
+      zp.saveConfig({ torRotateIdentity: false })
+    }
+  })
 })
 
 describe("retryableUpstream", () => {

@@ -260,7 +260,7 @@ function fakeLane(index, fingerprint, extra = {}) {
   }
 }
 
-function makeManager({ lanes = [], config = {} } = {}) {
+function makeManager({ lanes = [], config = {}, mintIdentity, mintTrace } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-tor-run-"))
   const manager = createLanes({
     config: {
@@ -278,7 +278,8 @@ function makeManager({ lanes = [], config = {} } = {}) {
       ...config,
     },
     log: () => {},
-    mintIdentity: () => ({ session: "ses_minted", project: "prj_minted" }),
+    mintIdentity: mintIdentity ?? (() => ({ session: "ses_minted", project: "prj_minted" })),
+    mintTrace: mintTrace ?? (() => ({ b3: "b3_minted", traceparent: "tp_minted" })),
   })
   manager.lanes.push(...lanes)
   return manager
@@ -557,6 +558,54 @@ describe("sticky mode", () => {
     const status = manager.status()
     assert.equal(status.sticky, true)
     assert.equal(status.width, 1)
+  })
+})
+
+describe("identity rotation", () => {
+  test("off by default: a lane reuses its minted pair and the caller's trace", async () => {
+    const manager = makeManager({ lanes: [fakeLane(0, "0".repeat(40))], config: { torSticky: true } })
+    const calls = stubPerLane({ 0: ok200 })
+    await manager.fetch("https://opencode.ai/x", { headers: { b3: "b3_caller" } }, { identity: true })
+    assert.equal(calls[0].headers["x-opencode-session"], "ses_lane_0", "the lane's stable pair is used")
+    assert.equal(calls[0].headers.b3, "b3_caller", "the caller's trace rides through untouched")
+  })
+
+  test("rotate identity mints a fresh session, project and trace on every attempt", async () => {
+    let n = 0
+    const manager = makeManager({
+      lanes: [fakeLane(0, "0".repeat(40))],
+      config: { torSticky: true, torRotateIdentity: true },
+      mintIdentity: () => ({ session: `ses_fresh_${++n}`, project: `prj_fresh_${n}` }),
+      mintTrace: () => ({ b3: `b3_fresh_${n}`, traceparent: `tp_fresh_${n}` }),
+    })
+    const calls = stubPerLane({ 0: ok200 })
+    await manager.fetch("https://opencode.ai/x", { headers: {} }, { identity: true })
+    await manager.fetch("https://opencode.ai/x", { headers: {} }, { identity: true })
+    assert.deepEqual(
+      calls.map((c) => c.headers["x-opencode-session"]),
+      ["ses_fresh_1", "ses_fresh_2"],
+      "each attempt carries a brand-new session, not the lane's stored pair",
+    )
+    assert.equal(calls[0].headers["x-opencode-project"], "prj_fresh_1")
+    assert.equal(calls[0].headers.b3, "b3_fresh_1")
+    assert.equal(calls[0].headers.traceparent, "tp_fresh_1")
+    assert.equal(calls[1].headers.b3, "b3_fresh_2", "a fresh trace root each time too")
+  })
+
+  test("a caller-owned session is still left untouched under rotation", async () => {
+    const manager = makeManager({ lanes: [fakeLane(0, "0".repeat(40))], config: { torSticky: true, torRotateIdentity: true } })
+    const calls = stubPerLane({ 0: ok200 })
+    await manager.fetch(
+      "https://opencode.ai/x",
+      { headers: { "x-opencode-session": "ses_caller" } },
+      { identity: false, stickyKey: "ses_caller" },
+    )
+    assert.equal(calls[0].headers["x-opencode-session"], "ses_caller", "the caller's pair is never rotated away")
+  })
+
+  test("status reports the rotation toggle", () => {
+    const manager = makeManager({ lanes: [fakeLane(0, "0".repeat(40))], config: { torRotateIdentity: true } })
+    assert.equal(manager.status().rotateIdentity, true)
   })
 })
 

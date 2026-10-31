@@ -457,6 +457,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. By default a call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Sticky mode instead rides one exit until the gate refuses it, then moves to the next — it does not fan out, so the rest of the fleet's allowances stay unspent. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
       <div class="checkbox"><input type="checkbox" id="cfgTor"><span>Route upstream calls through Tor exit lanes</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgTorSticky"><span>Sticky mode — ride one exit until it is refused, then move on (don't exhaust the fleet)</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgTorRotate"><span>Rotate identity per attempt — mint a fresh session + project + trace for every lane try (a brand-new "CLI process" each time)</span></div>
       <div class="formgrid">
         <div>
           <label>Lanes</label><input id="cfgTorLanes" type="number" min="1" max="64">
@@ -846,6 +847,7 @@ async function populateConfigForm() {
   $("cfgOverride").checked = !!config.overrideSession
   $("cfgTor").checked = !!config.torEnabled
   $("cfgTorSticky").checked = !!config.torSticky
+  $("cfgTorRotate").checked = !!config.torRotateIdentity
   $("cfgTorLanes").value = config.torLanes ?? 10
   $("cfgTorRace").value = config.torRaceWidth ?? 5
   $("cfgTorCountries").value = config.torCountries ?? ""
@@ -898,6 +900,7 @@ async function saveConfig() {
     overrideSession: $("cfgOverride").checked,
     torEnabled: $("cfgTor").checked,
     torSticky: $("cfgTorSticky").checked,
+    torRotateIdentity: $("cfgTorRotate").checked,
     torLanes: Number($("cfgTorLanes").value || 10),
     torRaceWidth: Number($("cfgTorRace").value || 5),
     torCountries: $("cfgTorCountries").value.trim(),
