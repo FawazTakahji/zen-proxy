@@ -453,6 +453,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <label>User-agent refresh interval (ms)</label><input id="cfgUaMs" type="number">
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgOverride"><span>Override a client-supplied session/project with the proxy's own rotating pair</span></div>
+      <label>Session + project rotation interval (ms, 0 = never rotate)</label><input id="cfgIdentityTtl" type="number" min="0" step="60000">
       <div class="row" style="margin-top:26px"><span class="hh" style="font-family:var(--mono);font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase">Tor exit lanes</span></div>
       <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. By default a call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Sticky mode instead rides one exit until the gate refuses it, then moves to the next — it does not fan out, so the rest of the fleet's allowances stay unspent. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
       <div class="checkbox"><input type="checkbox" id="cfgTor"><span>Route upstream calls through Tor exit lanes</span></div>
@@ -845,6 +846,7 @@ async function populateConfigForm() {
   $("cfgUaMs").value = config.uaRefreshMs ?? 21600000
   $("cfgInject").checked = config.injectSession !== false
   $("cfgOverride").checked = !!config.overrideSession
+  $("cfgIdentityTtl").value = config.identityTtlMs ?? 1800000
   $("cfgTor").checked = !!config.torEnabled
   $("cfgTorSticky").checked = !!config.torSticky
   $("cfgTorRotate").checked = !!config.torRotateIdentity
@@ -898,6 +900,8 @@ async function saveConfig() {
     uaRefreshMs: Number($("cfgUaMs").value || 21600000),
     injectSession: $("cfgInject").checked,
     overrideSession: $("cfgOverride").checked,
+    // Empty means "leave it alone"; 0 is a real value here (never rotate).
+    identityTtlMs: $("cfgIdentityTtl").value.trim() === "" ? 1800000 : Math.max(0, Number($("cfgIdentityTtl").value) || 0),
     torEnabled: $("cfgTor").checked,
     torSticky: $("cfgTorSticky").checked,
     torRotateIdentity: $("cfgTorRotate").checked,

@@ -413,6 +413,34 @@ describe("identityFor", () => {
     assert.notEqual(later.project, first.project, "project rotates with it — one pair, one client story")
   })
 
+  test("identityTtlMs: 0 pins the pair for good — no rotation at all", () => {
+    zp.saveConfig({ identityTtlMs: 0 })
+    try {
+      const req = mockReq({ remoteAddress: "6.6.6.6", headers: { "user-agent": "pinned/1" } })
+      const first = zp.identityFor(req, T0)
+      const aYearLater = zp.identityFor(req, T0 + 365 * 24 * 3600_000)
+      assert.equal(aYearLater.session, first.session, "the session never rotates")
+      assert.equal(aYearLater.project, first.project, "the project stays with it")
+    } finally {
+      zp.saveConfig({ identityTtlMs: zp.SESSION_MAX_AGE_MS })
+    }
+  })
+
+  test("identityTtlMs replaces the default window", () => {
+    zp.saveConfig({ identityTtlMs: 60_000 })
+    try {
+      const req = mockReq({ remoteAddress: "6.6.7.7", headers: { "user-agent": "short-ttl/1" } })
+      const first = zp.identityFor(req, T0)
+      const inside = zp.identityFor(req, T0 + 59_000)
+      const after = zp.identityFor(req, T0 + 60_001)
+      assert.equal(inside.session, first.session, "still inside the configured window")
+      assert.notEqual(after.session, first.session, "rotates at one minute, not thirty")
+      assert.notEqual(after.project, first.project, "both halves rotate together")
+    } finally {
+      zp.saveConfig({ identityTtlMs: zp.SESSION_MAX_AGE_MS })
+    }
+  })
+
   test("a caller-supplied session passes through untouched, project follows policy", () => {
     const id = zp.identityFor(mockReq({ headers: { "x-opencode-session": "ses_caller000001" } }))
     assert.equal(id.session, "ses_caller000001")

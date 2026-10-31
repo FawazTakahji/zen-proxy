@@ -294,6 +294,11 @@ function envNum(name, dflt) {
   return Number.isFinite(n) ? n : dflt
 }
 
+// A minted session id embeds its creation time and upstream is believed to
+// reject a stale one, so a pair is re-minted on a schedule by default.
+// `identityTtlMs` exposes that window; 0 turns rotation off entirely.
+const SESSION_MAX_AGE_MS = 30 * 60_000
+
 const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: envNum("PORT", 8787),
@@ -316,6 +321,11 @@ const DEFAULT_CONFIG = {
   // valid, and preserving it is the honest behaviour. On, every caller bucket
   // gets its own rotating pair even when the client sent one.
   overrideSession: ENV.OVERRIDE_SESSION === "1" || ENV.OVERRIDE_SESSION === "true",
+  // How long a minted session+project pair lives for one caller bucket. The
+  // default is the historical 30-minute rotation; 0 pins the pair for the whole
+  // process lifetime, so upstream keeps reading one CLI conversation in one
+  // project instead of a brand-new client every half hour.
+  identityTtlMs: envNum("IDENTITY_TTL_MS", SESSION_MAX_AGE_MS),
   // Which credentials the auto-sync health probe uses:
   //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
   //   "key"       — always use defaultZenKey (probe fails if none is set)
@@ -562,9 +572,8 @@ const NOT_CHAT_SERVABLE = [/^jev-/]
 // The trailing characters are random and not checked; the leading 12 are.
 const SESSION_HEADERS = ["x-opencode-session", "x-opencode-session-id"]
 const SESSION_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-// A session stays valid as long as its embedded timestamp is recent. Re-mint on a
-// schedule so a proxy left running for days does not start failing on a stale ID.
-const SESSION_MAX_AGE_MS = 30 * 60_000
+// A session stays valid as long as its embedded timestamp is recent (see
+// SESSION_MAX_AGE_MS above, the default for `identityTtlMs`).
 let sessionClock = { ms: 0, ctr: 0 }
 function genSessionId(now = Date.now()) {
   if (now !== sessionClock.ms) {
@@ -609,10 +618,19 @@ function genProjectHash() {
   return createHash("sha1").update(`directory:${randomBytes(18).toString("hex")}`).digest("hex")
 }
 const identityPool = new Map()
+// An explicit 0 (or any negative) is the opt-out: the pair is pinned for as long
+// as the process runs. Anything unset or unparseable keeps the historical
+// rotation so an older config file cannot accidentally freeze identities.
+function identityTtl() {
+  const ttl = Number(config.identityTtlMs)
+  if (!Number.isFinite(ttl) || ttl < 0) return SESSION_MAX_AGE_MS
+  return ttl
+}
 function mintedIdentity(req, now) {
   const key = identityBucketKey(req)
   const hit = identityPool.get(key)
-  if (hit && now - hit.at < SESSION_MAX_AGE_MS) {
+  const ttl = identityTtl()
+  if (hit && (ttl === 0 || now - hit.at < ttl)) {
     // Re-insert on hit so the map stays in least-recently-used order.
     identityPool.delete(key)
     identityPool.set(key, hit)
@@ -3915,6 +3933,9 @@ async function handleApiConfig(req, res) {
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
       cleaned.overrideSession = toBool(cleaned.overrideSession, config.overrideSession)
+      cleaned.identityTtlMs = num(cleaned.identityTtlMs ?? config.identityTtlMs, config.identityTtlMs)
+      // 0 is meaningful here (never rotate); a negative value is not.
+      if (cleaned.identityTtlMs < 0) cleaned.identityTtlMs = config.identityTtlMs
       cleaned.torEnabled = toBool(cleaned.torEnabled, config.torEnabled)
       cleaned.torSticky = toBool(cleaned.torSticky, config.torSticky)
       cleaned.torRotateIdentity = toBool(cleaned.torRotateIdentity, config.torRotateIdentity)
