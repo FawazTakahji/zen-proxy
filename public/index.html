@@ -454,6 +454,9 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgInject"><span>Inject <code>x-opencode-session</code> header per client (free tier needs it)</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgOverride"><span>Override a client-supplied session/project with the proxy's own rotating pair</span></div>
       <label>Session + project rotation interval (ms, 0 = never rotate)</label><input id="cfgIdentityTtl" type="number" min="0" step="60000">
+      <div class="checkbox"><input type="checkbox" id="cfgRoster"><span>Keep an identity roster — pick a saved session + project at startup and reuse it until it is marked limited (restart to switch)</span></div>
+      <label>Daily reset hour (UTC) <span class="hint">(1 = 04:00 GMT+3)</span></label><input id="cfgResetHour" type="number" min="0" max="23">
+      <div id="rosterBox" class="hint" style="margin-top:10px">identity roster: off</div>
       <div class="row" style="margin-top:26px"><span class="hh" style="font-family:var(--mono);font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase">Tor exit lanes</span></div>
       <p class="hint">Each lane is its own <code>tor</code> process pinned to an exit relay. By default a call is sent down a wave of exits at once; the first <code>200</code> wins and the rest are cut. Sticky mode instead rides one exit until the gate refuses it, then moves to the next — it does not fan out, so the rest of the fleet's allowances stay unspent. Needs Bun (Node's fetch ignores the per-lane proxy), and the first run downloads the ~30 MB Tor Expert Bundle unless a tor is on PATH.</p>
       <div class="checkbox"><input type="checkbox" id="cfgTor"><span>Route upstream calls through Tor exit lanes</span></div>
@@ -582,6 +585,7 @@ async function refreshStatus() {
     $("ovAllowed").textContent = st.models.allowed + " allowed"
     if (document.getElementById("tab-overview").classList.contains("active")) renderTable(st.recent)
     renderTor(st.lanes)
+    renderRoster(st.identity)
     hideBanner()
   } catch (e) {
     if (e.message !== "unauthorized") { $("upstreamDot").className = "dot bad"; $("upstreamText").textContent = "unreachable" }
@@ -658,6 +662,68 @@ function renderTor(info) {
       <td class="hint" style="margin:0">${escapeHtml(note)}</td>
     </tr>`
   }).join("")
+}
+
+// Roster times can be days away, so a bare clock time is not enough.
+function fmtWhen(ms) {
+  if (!ms) return "—"
+  const d = new Date(ms)
+  const sameDay = d.toDateString() === new Date().toDateString()
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
+  return sameDay ? time : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + time
+}
+function shortSession(s) {
+  const v = String(s ?? "")
+  return escapeHtml(v.slice(0, 10)) + "…" + escapeHtml(v.slice(-4))
+}
+function renderRoster(info) {
+  const box = $("rosterBox")
+  if (!info) {
+    box.innerHTML = "identity roster: off"
+    return
+  }
+  if (!info.active) {
+    box.innerHTML = info.tor
+      ? "identity roster: not used while Tor lanes own the identity"
+      : "identity roster: enabled — restart the proxy to pick a saved pair"
+    return
+  }
+  const cur = info.current
+  const now = Date.now()
+  const rows = (info.entries || []).map((e) => {
+    const limited = e.limitedUntil > now
+    const inUse = cur && e.session === cur.session
+    const state = limited
+      ? '<span class="badge warn">limited until ' + fmtWhen(e.limitedUntil) + "</span>"
+      : '<span class="badge ok">available</span>'
+    const tag = inUse ? ' <span class="badge mut">in use</span>' : ""
+    const action = limited
+      ? ` <button onclick="restoreIdentity('${escapeHtml(e.session)}')">restore</button>`
+      : ""
+    return `<div class="mono" style="margin-top:4px">${shortSession(e.session)} · prj:${escapeHtml(String(e.project).slice(0, 8))} · minted ${fmtWhen(e.createdAt)} · ${state}${tag}${action}</div>`
+  }).join("")
+  box.innerHTML =
+    `<div class="mono"><b>current:</b> ${shortSession(cur.session)} · prj:${escapeHtml(String(cur.project).slice(0, 8))} · minted ${fmtWhen(cur.createdAt)}</div>` +
+    `<div style="margin-top:8px"><button onclick="markIdentityLimited()">Mark current as limited</button> <span class="hint">next reset ${fmtWhen(info.resetAt)}</span></div>` +
+    `<div style="margin-top:8px">${rows || "no saved pairs yet"}</div>`
+}
+async function markIdentityLimited() {
+  try {
+    const r = await api("/api/identity/limit", { method: "POST" })
+    toast(r.ok ? "identity marked limited — restart to pick another" : r.error || "failed", r.ok ? "ok" : "warn")
+    refreshStatus()
+  } catch (e) {
+    toast(e.message, "bad")
+  }
+}
+async function restoreIdentity(session) {
+  try {
+    await api("/api/identity/restore", { method: "POST", body: JSON.stringify({ session }) })
+    toast("identity restored")
+    refreshStatus()
+  } catch (e) {
+    toast(e.message, "bad")
+  }
 }
 
 async function refreshModels() {
@@ -847,6 +913,8 @@ async function populateConfigForm() {
   $("cfgInject").checked = config.injectSession !== false
   $("cfgOverride").checked = !!config.overrideSession
   $("cfgIdentityTtl").value = config.identityTtlMs ?? 1800000
+  $("cfgRoster").checked = !!config.identityRoster
+  $("cfgResetHour").value = config.identityResetHourUtc ?? 1
   $("cfgTor").checked = !!config.torEnabled
   $("cfgTorSticky").checked = !!config.torSticky
   $("cfgTorRotate").checked = !!config.torRotateIdentity
@@ -902,6 +970,8 @@ async function saveConfig() {
     overrideSession: $("cfgOverride").checked,
     // Empty means "leave it alone"; 0 is a real value here (never rotate).
     identityTtlMs: $("cfgIdentityTtl").value.trim() === "" ? 1800000 : Math.max(0, Number($("cfgIdentityTtl").value) || 0),
+    identityRoster: $("cfgRoster").checked,
+    identityResetHourUtc: Math.min(23, Math.max(0, Number($("cfgResetHour").value) || 0)),
     torEnabled: $("cfgTor").checked,
     torSticky: $("cfgTorSticky").checked,
     torRotateIdentity: $("cfgTorRotate").checked,

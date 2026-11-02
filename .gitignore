@@ -1,6 +1,8 @@
 node_modules/
 .mimocode/
 zen-proxy.json
+# the identity roster is per-install state (chosen pairs + cooldowns), not source
+identity-roster.json
 # local publish mirror of this repo; never commit or install from it
 zen-proxy/
 *.log

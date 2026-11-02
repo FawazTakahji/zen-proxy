@@ -326,6 +326,13 @@ const DEFAULT_CONFIG = {
   // process lifetime, so upstream keeps reading one CLI conversation in one
   // project instead of a brand-new client every half hour.
   identityTtlMs: envNum("IDENTITY_TTL_MS", SESSION_MAX_AGE_MS),
+  // Persist the identity across runs. When on, the pair is picked once at
+  // startup from `identity-roster.json` (oldest eligible first) and never
+  // changes while the process runs; a pair marked limited is skipped until the
+  // daily reset. Minting only happens when nothing in the roster is eligible.
+  identityRoster: ENV.IDENTITY_ROSTER === "1" || ENV.IDENTITY_ROSTER === "true",
+  // Hour (UTC) the free tier's daily allowance resets. 01:00 UTC = 04:00 GMT+3.
+  identityResetHourUtc: envNum("IDENTITY_RESET_HOUR_UTC", 1),
   // Which credentials the auto-sync health probe uses:
   //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
   //   "key"       — always use defaultZenKey (probe fails if none is set)
@@ -663,12 +670,166 @@ function identityFor(req, now = Date.now()) {
           : config.projectHash || projectHash(),
     }
   }
+  // The roster (when enabled) is this run's identity: chosen once at startup,
+  // never rotated, and preferred over both the per-bucket mint and projectHash.
+  if (rosterIdentity) {
+    announceRoster()
+    return { session: rosterIdentity.session, injected: true, project: rosterIdentity.project }
+  }
   if (config.projectHash) {
     return { session: mintedIdentity(req, now).value, injected: true, project: config.projectHash }
   }
   const minted = mintedIdentity(req, now)
   return { session: minted.value, injected: true, project: minted.project }
 }
+
+// ---- identity roster -------------------------------------------------------
+// The free tier's allowance comes back at a fixed hour, so a pair that is spent
+// today is still worth keeping: the roster holds minted pairs on disk, picks the
+// oldest eligible one at startup, and never switches while the process runs.
+const ROSTER_PATH = path.join(path.dirname(CONFIG_PATH), "identity-roster.json")
+// Exported for tests and for anyone who wants to inspect the file by name.
+const IDENTITY_ROSTER_PATH = ROSTER_PATH
+const ROSTER_MAX = 200
+function loadRoster() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(ROSTER_PATH, "utf8"))
+    const entries = Array.isArray(raw?.entries) ? raw.entries : []
+    return entries
+      .filter((e) => e && typeof e.session === "string" && typeof e.project === "string")
+      .map((e) => ({
+        session: e.session,
+        project: e.project,
+        createdAt: Number(e.createdAt) || 0,
+        lastUsedAt: Number(e.lastUsedAt) || 0,
+        limitedUntil: Number(e.limitedUntil) || 0,
+      }))
+  } catch {
+    // A missing or unreadable roster just means "nothing saved yet"; it must
+    // never stop the proxy from booting.
+    return []
+  }
+}
+function saveRoster(entries) {
+  try {
+    fs.mkdirSync(path.dirname(ROSTER_PATH), { recursive: true })
+    const tmp = ROSTER_PATH + ".tmp"
+    fs.writeFileSync(tmp, JSON.stringify({ entries }, null, 2), { mode: 0o600 })
+    fs.renameSync(tmp, ROSTER_PATH)
+  } catch (err) {
+    console.error(`zen-proxy: cannot write the identity roster at ${ROSTER_PATH} (${err.message})`)
+  }
+}
+// The daily allowance resets at `identityResetHourUtc` (01:00 UTC = 04:00 GMT+3
+// by default). A stamp that is already in the past rolls to tomorrow's reset.
+function nextResetAt(now = Date.now()) {
+  const raw = Number(config.identityResetHourUtc)
+  const hour = Number.isFinite(raw) ? ((Math.trunc(raw) % 24) + 24) % 24 : 1
+  const d = new Date(now)
+  const reset = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour)
+  return reset > now ? reset : reset + 24 * 3600_000
+}
+/**
+ * Pick this run's identity: the oldest entry whose cooldown has expired.
+ *
+ * Age is the point — a pair minted days ago is the one the gate has seen
+ * longest. Only when every saved pair is still cooling down does a fresh one
+ * get minted, so the roster grows exactly as fast as limits are hit.
+ */
+function pickRosterIdentity(now = Date.now()) {
+  let entries = loadRoster()
+  const entry = entries
+    .filter((e) => !(e.limitedUntil > now))
+    .sort((a, b) => a.createdAt - b.createdAt || a.lastUsedAt - b.lastUsedAt)[0]
+  let chosen = entry
+  if (!chosen) {
+    chosen = {
+      session: genSessionId(now).value,
+      project: genProjectHash(),
+      createdAt: now,
+      lastUsedAt: now,
+      limitedUntil: 0,
+    }
+    entries.push(chosen)
+  }
+  chosen.lastUsedAt = now
+  // Bound the file: a long-lived install must not accumulate pairs forever.
+  if (entries.length > ROSTER_MAX) {
+    const others = entries
+      .filter((e) => e !== chosen)
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt)
+      .slice(0, entries.length - ROSTER_MAX)
+    const drop = new Set(others)
+    entries = entries.filter((e) => !drop.has(e))
+  }
+  saveRoster(entries)
+  return chosen
+}
+/** Park one stored pair until `until`; false when it was not in the roster. */
+function markRosterLimited(session, until) {
+  const entries = loadRoster()
+  const entry = entries.find((e) => e.session === session)
+  if (!entry) return false
+  const when = Number(until) || nextResetAt()
+  if (entry.limitedUntil >= when) return false
+  entry.limitedUntil = when
+  saveRoster(entries)
+  return true
+}
+/** Make a parked pair eligible again (a false positive, or the reset passed). */
+function clearRosterLimit(session) {
+  const entries = loadRoster()
+  const entry = entries.find((e) => e.session === session)
+  if (!entry || !entry.limitedUntil) return false
+  entry.limitedUntil = 0
+  saveRoster(entries)
+  return true
+}
+/**
+ * Record a daily limit against the identity this request actually used.
+ *
+ * Only a spent daily allowance is worth parking: the upgrade pitch, or a
+ * `Retry-After` measured in hours. A burst cooldown of minutes is not.
+ */
+function noteDailyLimit(identity, status, body, retryAfterS, roster = rosterIdentity) {
+  if (!roster || !identity || identity.session !== roster.session) return false
+  const wait = Number(retryAfterS) || 0
+  if (!exhaustedFreeVerdict(status, body) && wait < 3600) return false
+  const until = wait >= 3600 ? Date.now() + wait * 1000 : nextResetAt()
+  if (!markRosterLimited(roster.session, until)) return false
+  roster.limitedUntil = until
+  log(`   identity ${roster.session.slice(0, 10)}… marked limited until ${new Date(until).toISOString()}`)
+  return true
+}
+// Chosen once, at startup. `null` when the roster is off (or Tor owns identity).
+const rosterIdentity = config.identityRoster && !config.torEnabled ? pickRosterIdentity() : null
+// The logger is not usable at module-init time (its buffer is declared further
+// down), so the "which pair am I" line is emitted on the first request instead.
+let rosterAnnounced = false
+function announceRoster() {
+  if (!rosterIdentity || rosterAnnounced) return
+  rosterAnnounced = true
+  const age = Math.max(0, Math.round((Date.now() - rosterIdentity.createdAt) / 3600_000))
+  log(`identity roster: ${rosterIdentity.session.slice(0, 10)}… (minted ${age}h ago)`)
+}
+function identityStatus() {
+  if (!config.identityRoster) return null
+  return {
+    active: Boolean(rosterIdentity),
+    tor: Boolean(config.torEnabled),
+    current: rosterIdentity
+      ? {
+          session: rosterIdentity.session,
+          project: rosterIdentity.project,
+          createdAt: rosterIdentity.createdAt,
+          limitedUntil: rosterIdentity.limitedUntil ?? 0,
+        }
+      : null,
+    entries: loadRoster(),
+    resetAt: nextResetAt(),
+  }
+}
+
 function parseRetryAfter(v) {
   if (v == null) return 0
   const n = Number(v)
@@ -1865,6 +2026,11 @@ async function handleMessages(req, res) {
         lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
+      // A spent daily allowance parks the roster pair so the next boot picks a
+      // different one — the run itself never switches.
+      if (upstreamRes.status === 429) {
+        noteDailyLimit(identityFor(req), upstreamRes.status, lastErr, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+      }
       // The one 429 that is the caller's own spent allowance: retry the same
       // attempt under the configured key before the chain moves on. Same
       // attempt budget (attempt-- mirrors the 401 fallback above), once per
@@ -2154,6 +2320,9 @@ async function handleChat(req, res, responsesRoute = false) {
         lastErr = { error: { type: "invalid_request_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
+      if (upstreamRes.status === 429) {
+        noteDailyLimit(identityFor(req), upstreamRes.status, lastErr, parseRetryAfter(upstreamRes.headers.get("retry-after")))
+      }
       // Same BYOK escalation as the Anthropic loop: a genuinely spent identity
       // ("Free usage limit reached") retries the same attempt under the
       // configured key — once per request, no extra attempt budget, no shared
@@ -3939,6 +4108,11 @@ async function handleApiConfig(req, res) {
       cleaned.torEnabled = toBool(cleaned.torEnabled, config.torEnabled)
       cleaned.torSticky = toBool(cleaned.torSticky, config.torSticky)
       cleaned.torRotateIdentity = toBool(cleaned.torRotateIdentity, config.torRotateIdentity)
+      cleaned.identityRoster = toBool(cleaned.identityRoster, config.identityRoster)
+      cleaned.identityResetHourUtc = num(cleaned.identityResetHourUtc ?? config.identityResetHourUtc, config.identityResetHourUtc)
+      if (cleaned.identityResetHourUtc < 0 || cleaned.identityResetHourUtc > 23) {
+        cleaned.identityResetHourUtc = config.identityResetHourUtc
+      }
       cleaned.torStrictNodes = toBool(cleaned.torStrictNodes, config.torStrictNodes)
       cleaned.torProof = toBool(cleaned.torProof, config.torProof)
       cleaned.torDownload = toBool(cleaned.torDownload, config.torDownload)
@@ -4039,6 +4213,7 @@ async function handleStatus(req, res) {
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
     probeAuth: config.probeAuth ?? "auto",
     lanes: laneStatus(),
+    identity: identityStatus(),
     models: {
       total: cache.data.length,
       allowed: ALLOWED().size,
@@ -4349,6 +4524,26 @@ async function router(req, res) {
       requestStats.window60 = []
       return json(res, 200, { ok: true })
     }
+    if (p === "/api/identity/limit" && req.method === "POST") {
+      if (!adminAuth(req, res) || !adminWriteGuard(req, res)) return
+      if (!rosterIdentity) return json(res, 400, { error: "the identity roster is not active in this run" })
+      const until = nextResetAt()
+      markRosterLimited(rosterIdentity.session, until)
+      rosterIdentity.limitedUntil = until
+      log(`   identity ${rosterIdentity.session.slice(0, 10)}… marked limited by hand until ${new Date(until).toISOString()}`)
+      return json(res, 200, { ok: true, limitedUntil: until })
+    }
+    if (p === "/api/identity/restore" && req.method === "POST") {
+      if (!adminAuth(req, res) || !adminWriteGuard(req, res)) return
+      let session = rosterIdentity?.session ?? ""
+      try {
+        const body = JSON.parse((await readBody(req)) || "{}")
+        if (typeof body.session === "string" && body.session) session = body.session
+      } catch {}
+      if (!session) return json(res, 400, { error: "no identity to restore" })
+      const ok = clearRosterLimit(session)
+      return json(res, 200, { ok, session })
+    }
     return json(res, 404, { error: "not found" })
   }
 
@@ -4545,6 +4740,15 @@ laneStatus,
   identityFor,
   sessionFor,
   SESSION_MAX_AGE_MS,
+  IDENTITY_ROSTER_PATH,
+  loadRoster,
+  saveRoster,
+  pickRosterIdentity,
+  markRosterLimited,
+  clearRosterLimit,
+  nextResetAt,
+  identityStatus,
+  noteDailyLimit,
   MAX_BODY,
   VALID_MODEL_ID,
 }

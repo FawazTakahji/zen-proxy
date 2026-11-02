@@ -489,6 +489,69 @@ describe("identityFor", () => {
   })
 })
 
+describe("identity roster", () => {
+  const T0 = Date.UTC(2026, 10, 2, 12, 0, 0) // 2 Nov 2026, 12:00 UTC
+  const clean = () => fs.rmSync(zp.IDENTITY_ROSTER_PATH, { force: true })
+
+  test("the reset is the next configured UTC hour", () => {
+    const morning = Date.UTC(2026, 10, 2, 0, 30, 0)
+    assert.equal(zp.nextResetAt(morning), Date.UTC(2026, 10, 2, 1, 0, 0), "01:00 UTC = 04:00 GMT+3")
+    const afternoon = Date.UTC(2026, 10, 2, 14, 0, 0)
+    assert.equal(zp.nextResetAt(afternoon), Date.UTC(2026, 10, 3, 1, 0, 0), "past today's reset → tomorrow")
+  })
+
+  test("a pair is minted only when nothing eligible is saved", () => {
+    clean()
+    try {
+      const first = zp.pickRosterIdentity(T0)
+      assert.equal(zp.loadRoster().length, 1, "an empty roster grows by exactly one")
+      const again = zp.pickRosterIdentity(T0 + 3600_000)
+      assert.equal(again.session, first.session, "an eligible pair is reused, never replaced")
+      assert.equal(zp.loadRoster().length, 1, "reuse does not mint a second pair")
+    } finally {
+      clean()
+    }
+  })
+
+  test("only a daily verdict parks the pair; a short cooldown does not", () => {
+    clean()
+    try {
+      const roster = zp.pickRosterIdentity(T0)
+      const identity = { session: roster.session, project: roster.project, injected: true }
+      assert.equal(
+        zp.noteDailyLimit(identity, 429, { error: { message: "FreeUsageLimitError" } }, 900, roster),
+        false,
+        "a 15-minute cooldown is a wait, not a spent day",
+      )
+      assert.equal(zp.loadRoster().find((e) => e.session === roster.session).limitedUntil, 0)
+      assert.equal(
+        zp.noteDailyLimit(identity, 429, { error: { message: "Free usage limit reached. Subscribe to OpenCode Go" } }, 0, roster),
+        true,
+        "the upgrade pitch is a spent day",
+      )
+      assert.ok(zp.loadRoster().find((e) => e.session === roster.session).limitedUntil > T0)
+    } finally {
+      clean()
+    }
+  })
+
+  test("a limited pair is skipped until its reset, then comes back first", () => {
+    clean()
+    try {
+      const first = zp.pickRosterIdentity(T0)
+      const until = zp.nextResetAt(T0)
+      assert.equal(zp.markRosterLimited(first.session, until), true)
+      const second = zp.pickRosterIdentity(T0 + 60_000)
+      assert.notEqual(second.session, first.session, "a parked pair is not reused")
+      assert.equal(zp.loadRoster().length, 2, "nothing else eligible means one new pair")
+      const nextDay = zp.pickRosterIdentity(until + 1)
+      assert.equal(nextDay.session, first.session, "the oldest pair returns once the reset passes")
+    } finally {
+      clean()
+    }
+  })
+})
+
 describe("tor lane routing", () => {
   const restore = () => zp.saveConfig({ torEnabled: false })
 
