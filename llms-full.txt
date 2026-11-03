@@ -207,6 +207,23 @@ Two requirements and one warning:
 | `torDataDir` / `torBinary` | `""` / `""` | State (lanes, ledger, tor bundle) and an explicit tor path. Moving the data dir needs a restart |
 | `torDownload` / `torProof` / `torStrictNodes` / `torMaxCircuitDirtiness` | `true` / `true` / `true` / `600` | Download the bundle when needed; prove each exit through `check.torproject.org`; refuse a fallback outside the pinned relay; circuit rotation window |
 
+## Cloudflare WARP
+
+WARP's client can run in `proxy` mode, where it keeps a tunnel up and exposes a local HTTP proxy on `127.0.0.1:40000` without changing the device's default route. Pointing zen-proxy's upstream calls at that listener sends **only the proxy's traffic** through WARP; everything else on the machine keeps its normal network. This is a single egress, not a lane fleet — one WARP registration is one tunnel.
+
+Off by default. Turn it on with `WARP=1 bun zen-proxy.mjs`, from the dashboard (Settings → Cloudflare WARP), or with `"warpEnabled": true` in `zen-proxy.json`.
+
+```bash
+WARP=1 bun zen-proxy.mjs
+```
+
+- **Managed mode (default).** zen-proxy runs `warp-cli mode proxy`, `warp-cli proxy port <port>`, and `warp-cli connect` when it starts, then restores the client's previous mode and connection when it stops. Requires the Cloudflare WARP client and `warp-cli` (auto-detected on Windows; set `warpCli` for a custom path).
+- **External mode.** Set `warpManage: false` and point `warpProxy` at an already-running WARP proxy listener (local or remote). zen-proxy only uses it.
+- **It must prove it is WARP.** Every start and health probe fetches Cloudflare's `/cdn-cgi/trace` through the proxy and requires `warp=on`. A stale port, a stopped client, or a different proxy is an error; requests fail rather than fall back to the device's own address.
+- **Sticky exit (default).** Like Tor's sticky mode, WARP keeps one exit until it is refused: a `429` (except "Endpoint is unavailable") or a free-tier `403` makes zen-proxy disconnect and reconnect the client for a new address, then retry the same model. The identity moves with it — sticky WARP bypasses the identity roster and mints a fresh session+project pair for each new exit, because a new IP carrying the refused pair would defeat the rotation. A request may change the address at most `warpRotations` times before the fallback chain walks on, and each rotation may reconnect up to `warpRotateTries` times while it waits for an address that differs from the refused one. Rotation is a client reconnect, so it needs managed mode. Set `warpSticky: false` to keep one exit for the whole run.
+- **Tor wins.** If both `torEnabled` and `warpEnabled` are true, Tor lanes carry the traffic and WARP stays off.
+- **Bun.** Like the Tor lanes, this needs Bun: Node's `fetch` ignores the `proxy` option. Under Node, WARP refuses to start and requests fail rather than leak.
+
 ## configuration
 
 Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded when edited — the dashboard writes it too). Env vars can override at startup.
@@ -251,8 +268,13 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `torSweepMoves` / `torRounds` / `torRetryMs` / `torStreamGraceS` | `3` / `2` / `120000` / `120` | Lanes moved per sweep; initial pool walks when every lane fails; how long a live fleet keeps rotating exits before giving up; grace period so a reply body can finish |
 | `torDataDir` / `torBinary` / `torDownload` | `""` / `""` / `true` | Lane state, ledger and the Tor Expert Bundle download; explicit tor path; allow the bundle download |
 | `torProof` / `torStrictNodes` / `torMaxCircuitDirtiness` | `true` / `true` / `600` | Verify each exit via check.torproject.org; refuse a fallback outside the pinned relay; circuit rotation window |
+| `warpEnabled` | `false` | Route upstream calls through Cloudflare WARP's local proxy-mode listener (opt-in, needs Bun) |
+| `warpProxy` / `warpManage` | `http://127.0.0.1:40000` / `true` | The WARP listener; whether zen-proxy configures, connects, and restores the client itself |
+| `warpCli` / `warpProbeMs` | `""` / `60000` | Explicit `warp-cli` path (empty = PATH, then the Windows install); how often to re-prove `warp=on` |
+| `warpSticky` | `true` | Keep one exit + identity until refused, then reconnect for a new address and a fresh session+project pair |
+| `warpRotations` / `warpRotateTries` | `4` / `4` | Address changes one request may spend before the fallback chain moves on (`0` disables rotation); reconnects one rotation may try while waiting for a different address |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `OVERRIDE_SESSION=1`, `IDENTITY_TTL_MS`, `IDENTITY_ROSTER=1`, `IDENTITY_RESET_HOUR_UTC`, `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `TOR=1`, `TOR_STICKY=1`, `TOR_ROTATE_IDENTITY=1`, `TOR_LANES`, `TOR_RACE_WIDTH`, `TOR_COUNTRIES`, `TOR_FALLBACK_COUNTRIES`, `TOR_PREFERRED_COUNTRIES`, `TOR_SWEEP_S`, `TOR_SWEEP_MOVES`, `TOR_EXIT_SOFT_CAP`, `TOR_EXIT_HOLD_S`, `TOR_ROUNDS`, `TOR_STREAM_GRACE_S`, `TOR_MAX_CIRCUIT_DIRTINESS`, `TOR_BIN`, `TOR_DATA_DIR`, `TOR_DOWNLOAD=0`, `TOR_PROOF=0`, `TOR_STRICT_NODES=0`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `OVERRIDE_SESSION=1`, `IDENTITY_TTL_MS`, `IDENTITY_ROSTER=1`, `IDENTITY_RESET_HOUR_UTC`, `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `TOR=1`, `TOR_STICKY=1`, `TOR_ROTATE_IDENTITY=1`, `TOR_LANES`, `TOR_RACE_WIDTH`, `TOR_COUNTRIES`, `TOR_FALLBACK_COUNTRIES`, `TOR_PREFERRED_COUNTRIES`, `TOR_SWEEP_S`, `TOR_SWEEP_MOVES`, `TOR_EXIT_SOFT_CAP`, `TOR_EXIT_HOLD_S`, `TOR_ROUNDS`, `TOR_STREAM_GRACE_S`, `TOR_MAX_CIRCUIT_DIRTINESS`, `TOR_BIN`, `TOR_DATA_DIR`, `TOR_DOWNLOAD=0`, `TOR_PROOF=0`, `TOR_STRICT_NODES=0`, `WARP=1`, `WARP_PROXY`, `WARP_MANAGE=0`, `WARP_CLI`, `WARP_PROBE_MS`, `WARP_STICKY=0`, `WARP_ROTATIONS`, `WARP_ROTATE_TRIES`, `ZEN_PROXY_CONFIG` (custom config path).
 
 ### bring your own key
 

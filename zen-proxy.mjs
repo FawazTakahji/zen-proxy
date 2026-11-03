@@ -4,7 +4,8 @@ import fs from "node:fs"
 import path from "node:path"
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto"
 import { fileURLToPath } from "node:url"
-import { createLanes, installExitHandler } from "./tor.mjs"
+import { createLanes } from "./tor.mjs"
+import { createWarp, DEFAULT_WARP_PROXY, normalizeProxyUrl } from "./warp.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -420,6 +421,30 @@ const DEFAULT_CONFIG = {
   torProof: ENV.TOR_PROOF !== "0",
   torStrictNodes: ENV.TOR_STRICT_NODES !== "0",
   torMaxCircuitDirtiness: envNum("TOR_MAX_CIRCUIT_DIRTINESS", 600),
+  // ---- Cloudflare WARP -----------------------------------------------------
+  // Off by default. WARP's client in `proxy` mode tunnels only the traffic that
+  // points at its local listener, so this is the per-process answer: upstream
+  // calls leave through WARP, the rest of the device keeps its normal network.
+  // One client is one tunnel, so this is a transport rather than a lane fleet.
+  warpEnabled: ENV.WARP === "1" || ENV.WARP === "true",
+  // The local listener WARP exposes in proxy mode (HTTP CONNECT, which is what
+  // Bun's fetch speaks). A remote proxy works too, but only in external mode.
+  warpProxy: ENV.WARP_PROXY ?? DEFAULT_WARP_PROXY,
+  // Let zen-proxy switch the client into proxy mode, connect it, and restore
+  // the previous mode/connection when the proxy stops. Off means the client is
+  // already set up and only its listener is used.
+  warpManage: ENV.WARP_MANAGE !== "0" && ENV.WARP_MANAGE !== "false",
+  // Explicit warp-cli path; empty = PATH, then the Windows install location.
+  warpCli: ENV.WARP_CLI ?? "",
+  // How often the tunnel is re-proved with Cloudflare's trace endpoint.
+  warpProbeMs: envNum("WARP_PROBE_MS", 60_000),
+  // Sticky mode: ride one exit until it is refused, then reconnect for a new
+  // address and mint a fresh identity with it. Off = one exit for the run.
+  warpSticky: ENV.WARP_STICKY !== "0" && ENV.WARP_STICKY !== "false",
+  // How many address changes one request may spend before the chain walks on.
+  warpRotations: envNum("WARP_ROTATIONS", 4),
+  // How many reconnects a single rotation may try before giving up on a new IP.
+  warpRotateTries: envNum("WARP_ROTATE_TRIES", 4),
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -625,6 +650,17 @@ function genProjectHash() {
   return createHash("sha1").update(`directory:${randomBytes(18).toString("hex")}`).digest("hex")
 }
 const identityPool = new Map()
+// Sticky WARP owns its identity: one pair per exit, minted when the exit is
+// chosen and replaced together with the exit. The roster's "one pair for the
+// run" rule assumes a fixed exit, so sticky WARP deliberately bypasses it.
+let warpIdentity = null
+function mintWarpIdentity() {
+  const fresh = genSessionId()
+  return { session: fresh.value, project: genProjectHash(), at: fresh.at }
+}
+function warpStickyActive() {
+  return Boolean(config.warpEnabled && config.warpSticky !== false && !config.torEnabled)
+}
 // An explicit 0 (or any negative) is the opt-out: the pair is pinned for as long
 // as the process runs. Anything unset or unparseable keeps the historical
 // rotation so an older config file cannot accidentally freeze identities.
@@ -669,6 +705,13 @@ function identityFor(req, now = Date.now()) {
           ? callerProject.trim()
           : config.projectHash || projectHash(),
     }
+  }
+  // Sticky WARP: the pair belongs to the exit, so it is minted when the exit is
+  // first used and replaced whenever the exit is. This is why the roster is
+  // bypassed here — a fresh IP with the refused pair would defeat the rotation.
+  if (warpStickyActive()) {
+    if (!warpIdentity) warpIdentity = mintWarpIdentity()
+    return { session: warpIdentity.session, injected: true, project: warpIdentity.project }
   }
   // The roster (when enabled) is this run's identity: chosen once at startup,
   // never rotated, and preferred over both the per-bucket mint and projectHash.
@@ -1900,6 +1943,8 @@ async function handleMessages(req, res) {
   const fallbackAuth = config.proxyKey ? null : config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
   let triedFallback = false
   let triedByok = false
+  // Sticky WARP: how many exits this request may spend before the chain walks on.
+  let warpRotationsLeft = Math.max(0, Number(config.warpRotations) || 0)
 
   let lastErr = null
   let lastStatus = 502
@@ -2048,6 +2093,15 @@ async function handleMessages(req, res) {
         attempt--
         continue
       }
+      // Sticky WARP: a refusal belongs to the exit, not the model. Move the
+      // exit (and the identity with it) and retry the same model.
+      if (warpRotationsLeft > 0 && warpShouldRotate(upstreamRes.status, lastErr)) {
+        warpRotationsLeft -= 1
+        if (await rotateWarp(`${model} ${upstreamRes.status}`)) {
+          attempt -= 1
+          continue
+        }
+      }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -2132,6 +2186,8 @@ async function handleChat(req, res, responsesRoute = false) {
   const fallbackAuth = config.proxyKey ? null : config.defaultZenKey ? `Bearer ${config.defaultZenKey}` : "Bearer public"
   let triedFallback = false
   let triedByok = false
+  // Sticky WARP: how many exits this request may spend before the chain walks on.
+  let warpRotationsLeft = Math.max(0, Number(config.warpRotations) || 0)
   let lastErr = null
   let lastStatus = 502
   let firstErr = null
@@ -2339,6 +2395,15 @@ async function handleChat(req, res, responsesRoute = false) {
         log(`   exhausted free allowance on ${model} — same attempt once under BYOK (${maskKey(config.defaultZenKey)})`)
         attempt--
         continue
+      }
+      // Sticky WARP: a refusal belongs to the exit, not the model. Move the
+      // exit (and the identity with it) and retry the same model.
+      if (warpRotationsLeft > 0 && warpShouldRotate(upstreamRes.status, lastErr)) {
+        warpRotationsLeft -= 1
+        if (await rotateWarp(`${model} ${upstreamRes.status}`)) {
+          attempt -= 1
+          continue
+        }
       }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
@@ -4130,6 +4195,22 @@ async function handleApiConfig(req, res) {
       ]) {
         if (key in cleaned) cleaned[key] = Math.max(0, num(cleaned[key], config[key]))
       }
+      cleaned.warpEnabled = toBool(cleaned.warpEnabled, config.warpEnabled)
+      cleaned.warpManage = toBool(cleaned.warpManage, config.warpManage)
+      cleaned.warpCli = typeof cleaned.warpCli === "string" ? cleaned.warpCli.trim() : config.warpCli
+      cleaned.warpProbeMs = Math.max(10_000, num(cleaned.warpProbeMs ?? config.warpProbeMs, config.warpProbeMs))
+      cleaned.warpSticky = toBool(cleaned.warpSticky, config.warpSticky)
+      cleaned.warpRotations = Math.max(0, Math.min(20, num(cleaned.warpRotations ?? config.warpRotations, config.warpRotations)))
+      cleaned.warpRotateTries = Math.max(1, Math.min(6, num(cleaned.warpRotateTries ?? config.warpRotateTries, config.warpRotateTries)))
+      if (typeof cleaned.warpProxy === "string") {
+        try {
+          cleaned.warpProxy = normalizeProxyUrl(cleaned.warpProxy)
+        } catch {
+          cleaned.warpProxy = config.warpProxy
+        }
+      } else {
+        cleaned.warpProxy = config.warpProxy
+      }
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
@@ -4161,6 +4242,9 @@ async function handleApiConfig(req, res) {
         cleaned.modelAliases = config.modelAliases
       }
       const torWasEnabled = config.torEnabled
+      const warpWasEnabled = config.warpEnabled
+      const warpPrevProxy = config.warpProxy
+      const warpPrevManage = config.warpManage
       saveConfig(cleaned)
       // Toggling the lanes off has to do what it says: stop the tor children,
       // not just stop routing to them. Turning them on starts the fleet on the
@@ -4174,6 +4258,22 @@ async function handleApiConfig(req, res) {
           activeLanes()
         }
       }
+      // WARP is a single tunnel, so its rules are simpler: turning it off stops
+      // the client and restores its previous mode; turning it on (or moving the
+      // endpoint) reconnects; Tor winning the egress stops it.
+      const warpChanged = warpPrevProxy !== config.warpProxy || warpPrevManage !== config.warpManage
+      const warpWanted = config.warpEnabled && !config.torEnabled
+      if (warpManagerRef && warpWasEnabled && (!warpWanted || warpChanged)) {
+        warpManagerRef.stop()
+        log("warp disabled — client restored")
+      }
+      if (warpWanted && (!warpWasEnabled || warpChanged || (torWasEnabled && !config.torEnabled))) {
+        log("warp enabled — connecting through Cloudflare WARP")
+        activeWarp()
+      }
+      // A disabled or non-sticky tunnel has no exit to own a pair; drop it so a
+      // later enable starts from the new exit rather than reusing the old one.
+      if (!warpStickyActive()) warpIdentity = null
       scheduleSync()
       scheduleUA()
       log("config updated via UI")
@@ -4213,6 +4313,7 @@ async function handleStatus(req, res) {
     rateLimit: { max: config.rateLimitMax, windowMs: config.rateLimitWindowMs },
     probeAuth: config.probeAuth ?? "auto",
     lanes: laneStatus(),
+    warp: warpStatus(),
     identity: identityStatus(),
     models: {
       total: cache.data.length,
@@ -4259,6 +4360,31 @@ const laneConfig = new Proxy(
 let laneManagerRef = null
 let laneStartPending = null
 
+// Both transports own child processes or a system client, so shutdown has to
+// stop whichever ones exist. One registry keeps a second SIGINT handler from
+// calling process.exit() before the first transport has restored itself.
+const transportStops = new Set()
+let transportExitInstalled = false
+function registerTransportStop(stop) {
+  transportStops.add(stop)
+  if (transportExitInstalled) return
+  transportExitInstalled = true
+  const bye = () => {
+    for (const fn of transportStops) {
+      try {
+        fn()
+      } catch {}
+    }
+  }
+  process.once("exit", bye)
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.once(sig, () => {
+      bye()
+      process.exit(0)
+    })
+  }
+}
+
 function laneManager() {
   if (!laneManagerRef) {
     laneManagerRef = createLanes({
@@ -4271,7 +4397,7 @@ function laneManager() {
     })
     // A lane is a tor child process: however this process ends, it must not
     // leave ten of them behind.
-    installExitHandler(laneManagerRef)
+    registerTransportStop(() => laneManagerRef?.stop())
   }
   return laneManagerRef
 }
@@ -4299,17 +4425,26 @@ function activeLanes() {
 async function upstreamFetch(url, init, opts = {}) {
   // Tor on: every upstream call goes down a lane, even the first one before any
   // lane is hot — never the device's own address. Tor off: a plain fetch.
-  if (!config.torEnabled) return fetch(url, init)
-  const manager = activeLanes()
-  if (!manager.started) {
-    // Wait for the fleet to come up (activeLanes() already kicked start() off).
-    // start() reports its own failure in status().error; fetchWithLanes surfaces
-    // it instead of silently falling back to the device network.
-    try {
-      await manager.start()
-    } catch {}
+  if (config.torEnabled) {
+    const manager = activeLanes()
+    if (!manager.started) {
+      // Wait for the fleet to come up (activeLanes() already kicked start() off).
+      // start() reports its own failure in status().error; fetchWithLanes surfaces
+      // it instead of silently falling back to the device network.
+      try {
+        await manager.start()
+      } catch {}
+    }
+    return manager.fetch(url, init, opts)
   }
-  return manager.fetch(url, init, opts)
+  // WARP on: every upstream call goes through the local WARP listener. A
+  // manager that is not ready throws; it never quietly uses the device network.
+  if (config.warpEnabled) {
+    const manager = activeWarp()
+    if (!manager) throw new Error("WARP is enabled but its tunnel is unavailable")
+    return manager.fetch(url, init)
+  }
+  return fetch(url, init)
 }
 
 /**
@@ -4339,6 +4474,103 @@ function laneStatus() {
     }
   }
   return laneManagerRef.status()
+}
+
+// ---- Cloudflare WARP --------------------------------------------------------
+// One tunnel, not a fleet. The manager is lazy so importing this module never
+// touches the WARP client; the first request (or startup) brings it up.
+let warpManagerRef = null
+
+function warpManager() {
+  if (!warpManagerRef) {
+    warpManagerRef = createWarp({
+      config: laneConfig,
+      log: (msg) => log(msg),
+    })
+    registerTransportStop(() => warpManagerRef?.stop())
+  }
+  return warpManagerRef
+}
+
+/** The tunnel, started on first use when enabled and Tor is not in charge. */
+function activeWarp() {
+  if (!config.warpEnabled || config.torEnabled) return null
+  const manager = warpManager()
+  if (manager.state !== "hot" && manager.state !== "booting") {
+    manager.start().catch(() => {})
+  }
+  return manager
+}
+
+/**
+ * A refusal worth spending an exit on.
+ *
+ * Mirrors the Tor sticky rule: a 429 moves to another exit unless the message
+ * is the edge itself being unavailable, and a 403 only when it is the free-tier
+ * gate. Rotation is a reconnect, so it needs managed mode.
+ */
+function warpShouldRotate(status, body) {
+  if (!warpStickyActive() || config.warpManage === false) return false
+  const text = typeof body === "string" ? body : JSON.stringify(body ?? "")
+  if (status === 429) return !/Endpoint is unavailable/i.test(text)
+  if (status === 403) return /FreeTierError|free.?tier/i.test(text)
+  return false
+}
+
+/**
+ * Move the exit and the identity together. The new pair is minted only after
+ * the client proved a different `warp=on` address, so a failed rotation never
+ * leaves a fresh identity riding the refused exit.
+ */
+async function rotateWarp(reason) {
+  const manager = activeWarp()
+  if (!manager) return false
+  try {
+    await manager.rotate(reason)
+    warpIdentity = mintWarpIdentity()
+    return true
+  } catch (err) {
+    log(`warp: ${err.message}`)
+    return false
+  }
+}
+
+function warpStatus() {
+  const base = warpManagerRef
+    ? warpManagerRef.status()
+    : {
+        enabled: Boolean(config.warpEnabled),
+        active: false,
+        managed: config.warpManage !== false,
+        state: "off",
+        proxy: String(config.warpProxy ?? DEFAULT_WARP_PROXY),
+        ip: "",
+        warp: "",
+        loc: "",
+        colo: "",
+        served: 0,
+        error: "",
+        note: config.torEnabled && config.warpEnabled ? "Tor lanes take precedence" : "",
+        since: 0,
+        lastProbeAt: 0,
+        lastFetchAt: 0,
+        client: "",
+        sticky: config.warpSticky !== false && config.warpManage !== false,
+        rotations: 0,
+        lastRotateAt: 0,
+        lastReason: "",
+      }
+  return {
+    ...base,
+    identity:
+      warpStickyActive() && warpIdentity
+        ? {
+            session: warpIdentity.session,
+            project: warpIdentity.project,
+            at: warpIdentity.at,
+          }
+        : null,
+  }
 }
 
 function parseKey(key) {
@@ -4659,6 +4891,17 @@ if (isMain) {
         })
         .catch((err) => log(`tor: could not start lanes (${err.message})`))
     }
+    if (config.warpEnabled && !config.torEnabled) {
+      log("warp enabled — connecting through Cloudflare WARP")
+      warpManager()
+        .start()
+        .then((status) => {
+          if (status.state !== "hot") {
+            log(`warp: not ready (${status.error || status.state}) — requests fail rather than ride your own address`)
+          }
+        })
+        .catch((err) => log(`warp: could not start (${err.message})`))
+    }
     scheduleSync()
     scheduleUA()
   })
@@ -4669,6 +4912,8 @@ export {
   config,
 laneStatus,
   laneManager,
+  warpStatus,
+  warpManager,
   upstreamFetch,
   laneOpts,
   aliasGatedTools,

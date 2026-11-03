@@ -393,6 +393,12 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
         <tbody></tbody>
       </table>
     </div>
+
+    <div class="panel" id="warpPanel">
+      <h2><span class="hh">Cloudflare WARP</span><span class="badge mut" id="warpBadge">off</span></h2>
+      <p class="hint" id="warpHint">Off. Enable it in Settings to route only zen-proxy's upstream calls through WARP.</p>
+      <div id="warpBody" class="hint mono" style="margin-top:10px"></div>
+    </div>
   </section>
 
   <section class="tab" id="tab-models">
@@ -481,6 +487,22 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <div class="checkbox"><input type="checkbox" id="cfgTorDownload"><span>Download the Tor Expert Bundle when no usable tor is found</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgTorProof"><span>Prove each lane's exit through <code>check.torproject.org</code></span></div>
       <div class="checkbox"><input type="checkbox" id="cfgTorStrict"><span>Strict exits (a lane dies rather than leave the requested country)</span></div>
+      <div class="row" style="margin-top:26px"><span class="hh" style="font-family:var(--mono);font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase">Cloudflare WARP</span></div>
+      <p class="hint">WARP's client in <code>proxy</code> mode tunnels only the traffic that points at its local listener, so enabling this sends zen-proxy's upstream calls through WARP while the rest of the device keeps its normal network. One client is one tunnel — this is a single egress, not a lane fleet. Managed mode switches the client to proxy mode, connects it, and restores the previous mode and connection when the proxy stops. Tor lanes take precedence when both are on.</p>
+      <div class="checkbox"><input type="checkbox" id="cfgWarp"><span>Route upstream calls through Cloudflare WARP</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgWarpManage"><span>Let zen-proxy configure and connect the WARP client (restores the previous mode on exit)</span></div>
+      <div class="checkbox"><input type="checkbox" id="cfgWarpSticky"><span>Sticky exit: keep the IP + identity until refused, then reconnect for a new one</span></div>
+      <div class="formgrid">
+        <div>
+          <label>WARP proxy URL <span class="hint">(proxy mode listens here)</span></label><input id="cfgWarpProxy" type="text">
+          <label>warp-cli path <span class="hint">(empty = auto-detect)</span></label><input id="cfgWarpCli" type="text">
+        </div>
+        <div>
+          <label>Health probe interval (ms)</label><input id="cfgWarpProbe" type="number" min="10000">
+          <label>Rotations per request <span class="hint">(0 = never rotate)</span></label><input id="cfgWarpRotations" type="number" min="0" max="20">
+          <label>Reconnects per rotation <span class="hint">(until the IP changes)</span></label><input id="cfgWarpRotateTries" type="number" min="1" max="6">
+        </div>
+      </div>
       <div class="checkbox"><input type="checkbox" id="cfgRateLimit"><span>Rate-limit chat requests per client (0 = off)</span></div>
       <div class="row" style="gap:10px;margin-top:6px">
         <div><label>Requests / window</label><input id="cfgRateMax" type="number" min="0" style="width:120px"></div>
@@ -585,6 +607,7 @@ async function refreshStatus() {
     $("ovAllowed").textContent = st.models.allowed + " allowed"
     if (document.getElementById("tab-overview").classList.contains("active")) renderTable(st.recent)
     renderTor(st.lanes)
+    renderWarp(st.warp)
     renderRoster(st.identity)
     hideBanner()
   } catch (e) {
@@ -662,6 +685,38 @@ function renderTor(info) {
       <td class="hint" style="margin:0">${escapeHtml(note)}</td>
     </tr>`
   }).join("")
+}
+
+function renderWarp(info) {
+  const badge = $("warpBadge"), hint = $("warpHint"), body = $("warpBody")
+  if (!info || !info.enabled) {
+    badge.textContent = "off"
+    badge.className = "badge mut"
+    hint.textContent = "Off. Enable it in Settings to route only zen-proxy's upstream calls through WARP."
+    body.innerHTML = ""
+    return
+  }
+  const state = info.state || "off"
+  const cls = state === "hot" ? "ok" : state === "dead" ? "bad" : state === "degraded" ? "warn" : "mut"
+  badge.textContent = state
+  badge.className = "badge " + cls
+  const bits = []
+  if (info.note) bits.push(info.note)
+  else if (state === "hot") bits.push("only zen-proxy traffic leaves through WARP")
+  bits.push(info.managed ? "managed client" : "external proxy")
+  bits.push(info.sticky ? "sticky: new IP + identity on refusal" : "one exit for the run")
+  if (info.error) bits.push(info.error)
+  hint.textContent = bits.join(" · ")
+  const trace = [info.ip, info.loc, info.colo].filter(Boolean).map(escapeHtml).join(" · ")
+  const ident = info.identity
+    ? `<div><b>identity:</b> <span class="mono">${escapeHtml(info.identity.session.slice(0, 12))}…</span> · project <span class="mono">${escapeHtml(info.identity.project.slice(0, 8))}…</span></div>`
+    : ""
+  body.innerHTML =
+    `<div><b>proxy:</b> ${escapeHtml(info.proxy || "—")} · <b>served:</b> ${info.served || 0} · <b>rotations:</b> ${info.rotations || 0}</div>` +
+    (trace ? `<div><b>egress:</b> ${trace}</div>` : "") +
+    ident +
+    (info.lastReason ? `<div><b>last rotation:</b> ${escapeHtml(info.lastReason)}</div>` : "") +
+    (info.client ? `<div><b>client:</b> ${escapeHtml(info.client)}</div>` : "")
 }
 
 // Roster times can be days away, so a bare clock time is not enough.
@@ -931,6 +986,14 @@ async function populateConfigForm() {
   $("cfgTorDownload").checked = config.torDownload !== false
   $("cfgTorProof").checked = config.torProof !== false
   $("cfgTorStrict").checked = config.torStrictNodes !== false
+  $("cfgWarp").checked = !!config.warpEnabled
+  $("cfgWarpManage").checked = config.warpManage !== false
+  $("cfgWarpSticky").checked = config.warpSticky !== false
+  $("cfgWarpProxy").value = config.warpProxy ?? "http://127.0.0.1:40000"
+  $("cfgWarpCli").value = config.warpCli ?? ""
+  $("cfgWarpProbe").value = config.warpProbeMs ?? 60000
+  $("cfgWarpRotations").value = config.warpRotations ?? 4
+  $("cfgWarpRotateTries").value = config.warpRotateTries ?? 4
   $("cfgRateLimit").checked = Number(config.rateLimitMax) > 0
   $("cfgRateMax").value = config.rateLimitMax ?? 0
   $("cfgRateWindow").value = config.rateLimitWindowMs ?? 60000
@@ -988,6 +1051,14 @@ async function saveConfig() {
     torDownload: $("cfgTorDownload").checked,
     torProof: $("cfgTorProof").checked,
     torStrictNodes: $("cfgTorStrict").checked,
+    warpEnabled: $("cfgWarp").checked,
+    warpManage: $("cfgWarpManage").checked,
+    warpSticky: $("cfgWarpSticky").checked,
+    warpProxy: $("cfgWarpProxy").value.trim(),
+    warpCli: $("cfgWarpCli").value.trim(),
+    warpProbeMs: Number($("cfgWarpProbe").value || 60000),
+    warpRotations: Number($("cfgWarpRotations").value || 0),
+    warpRotateTries: Number($("cfgWarpRotateTries").value || 4),
     rateLimitMax: $("cfgRateLimit").checked ? Number($("cfgRateMax").value || 0) : 0,
     rateLimitWindowMs: Number($("cfgRateWindow").value || 60000),
   }
