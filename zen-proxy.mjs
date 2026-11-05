@@ -2,6 +2,7 @@
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
+import { spawn } from "node:child_process"
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { createLanes } from "./tor.mjs"
@@ -445,6 +446,9 @@ const DEFAULT_CONFIG = {
   warpRotations: envNum("WARP_ROTATIONS", 4),
   // How many reconnects a single rotation may try before giving up on a new IP.
   warpRotateTries: envNum("WARP_ROTATE_TRIES", 4),
+  // A short system sound when the egress changes (a WARP address or a Tor
+  // lane), so a rotation is noticeable without watching the dashboard.
+  switchSound: ENV.SWITCH_SOUND !== "0" && ENV.SWITCH_SOUND !== "false",
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -2093,19 +2097,24 @@ async function handleMessages(req, res) {
         attempt--
         continue
       }
-      // Sticky WARP: a refusal belongs to the exit, not the model. Move the
-      // exit (and the identity with it) and retry the same model.
-      if (warpRotationsLeft > 0 && warpShouldRotate(upstreamRes.status, lastErr)) {
-        warpRotationsLeft -= 1
-        if (await rotateWarp(`${model} ${upstreamRes.status}`)) {
-          attempt -= 1
-          continue
-        }
-      }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      // A 429 often clears by itself (shared bucket, one backend hiccup), so
+      // give the same exit a couple of retries before spending a new address on
+      // it. `retriesPerModel` (default 2) is the number of *extra* attempts, so
+      // the current IP gets three tries in total.
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
+      }
+      // Sticky WARP: a refusal belongs to the exit, not the model. Move the
+      // exit (and the identity with it) and start a fresh attempt budget on
+      // the new address.
+      if (warpRotationsLeft > 0 && warpShouldRotate(upstreamRes.status, lastErr)) {
+        warpRotationsLeft -= 1
+        if (await rotateWarp(`${model} ${upstreamRes.status}`)) {
+          attempt = -1
+          continue
+        }
       }
       recordObserved(model, false)
       if (retryableUpstream(upstreamRes.status, lastErr)) {
@@ -2396,19 +2405,24 @@ async function handleChat(req, res, responsesRoute = false) {
         attempt--
         continue
       }
-      // Sticky WARP: a refusal belongs to the exit, not the model. Move the
-      // exit (and the identity with it) and retry the same model.
-      if (warpRotationsLeft > 0 && warpShouldRotate(upstreamRes.status, lastErr)) {
-        warpRotationsLeft -= 1
-        if (await rotateWarp(`${model} ${upstreamRes.status}`)) {
-          attempt -= 1
-          continue
-        }
-      }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
+      // A 429 often clears by itself (shared bucket, one backend hiccup), so
+      // give the same exit a couple of retries before spending a new address on
+      // it. `retriesPerModel` (default 2) is the number of *extra* attempts, so
+      // the current IP gets three tries in total.
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
+      }
+      // Sticky WARP: a refusal belongs to the exit, not the model. Move the
+      // exit (and the identity with it) and start a fresh attempt budget on
+      // the new address.
+      if (warpRotationsLeft > 0 && warpShouldRotate(upstreamRes.status, lastErr)) {
+        warpRotationsLeft -= 1
+        if (await rotateWarp(`${model} ${upstreamRes.status}`)) {
+          attempt = -1
+          continue
+        }
       }
       // Try the next candidate not only on 429/5xx but also when the upstream
       // reports a model/environment-level failure (e.g. a provider that is
@@ -4202,6 +4216,7 @@ async function handleApiConfig(req, res) {
       cleaned.warpSticky = toBool(cleaned.warpSticky, config.warpSticky)
       cleaned.warpRotations = Math.max(0, Math.min(20, num(cleaned.warpRotations ?? config.warpRotations, config.warpRotations)))
       cleaned.warpRotateTries = Math.max(1, Math.min(6, num(cleaned.warpRotateTries ?? config.warpRotateTries, config.warpRotateTries)))
+      cleaned.switchSound = toBool(cleaned.switchSound, config.switchSound)
       if (typeof cleaned.warpProxy === "string") {
         try {
           cleaned.warpProxy = normalizeProxyUrl(cleaned.warpProxy)
@@ -4394,6 +4409,7 @@ function laneManager() {
       // the CLI's own shape rather than a second dialect of it.
       mintIdentity: () => ({ session: genSessionId().value, project: genProjectHash() }),
       mintTrace: () => mintTrace(),
+      onSwitch: playSwitchSound,
     })
     // A lane is a tor child process: however this process ends, it must not
     // leave ten of them behind.
@@ -4503,6 +4519,40 @@ function activeWarp() {
 }
 
 /**
+ * A short noise when the egress changes.
+ *
+ * Rotations are easy to miss in a terminal nobody is watching. Windows gets the
+ * scheme's notification sound through PowerShell (detached, so the request is
+ * never held up); elsewhere the terminal bell. Throttled, because a Tor sweep
+ * can move several lanes in the same second and should sound like one event.
+ */
+let lastSwitchSoundAt = 0
+function playSwitchSound() {
+  if (config.switchSound === false) return
+  const at = Date.now()
+  if (at - lastSwitchSoundAt < 3000) return
+  lastSwitchSoundAt = at
+  try {
+    if (process.platform === "win32") {
+      spawn(
+        "powershell",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-WindowStyle",
+          "Hidden",
+          "-Command",
+          "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 250",
+        ],
+        { detached: true, stdio: "ignore", windowsHide: true },
+      ).unref()
+    } else {
+      process.stdout.write("\x07")
+    }
+  } catch {}
+}
+
+/**
  * A refusal worth spending an exit on.
  *
  * Mirrors the Tor sticky rule: a 429 moves to another exit unless the message
@@ -4528,6 +4578,7 @@ async function rotateWarp(reason) {
   try {
     await manager.rotate(reason)
     warpIdentity = mintWarpIdentity()
+    playSwitchSound()
     return true
   } catch (err) {
     log(`warp: ${err.message}`)

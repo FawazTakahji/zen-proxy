@@ -503,6 +503,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
           <label>Reconnects per rotation <span class="hint">(until the IP changes)</span></label><input id="cfgWarpRotateTries" type="number" min="1" max="6">
         </div>
       </div>
+      <div class="checkbox"><input type="checkbox" id="cfgSwitchSound"><span>Play a short sound when the egress changes (WARP IP or Tor lane)</span></div>
       <div class="checkbox"><input type="checkbox" id="cfgRateLimit"><span>Rate-limit chat requests per client (0 = off)</span></div>
       <div class="row" style="gap:10px;margin-top:6px">
         <div><label>Requests / window</label><input id="cfgRateMax" type="number" min="0" style="width:120px"></div>
@@ -994,6 +995,7 @@ async function populateConfigForm() {
   $("cfgWarpProbe").value = config.warpProbeMs ?? 60000
   $("cfgWarpRotations").value = config.warpRotations ?? 4
   $("cfgWarpRotateTries").value = config.warpRotateTries ?? 4
+  $("cfgSwitchSound").checked = config.switchSound !== false
   $("cfgRateLimit").checked = Number(config.rateLimitMax) > 0
   $("cfgRateMax").value = config.rateLimitMax ?? 0
   $("cfgRateWindow").value = config.rateLimitWindowMs ?? 60000
@@ -1059,6 +1061,7 @@ async function saveConfig() {
     warpProbeMs: Number($("cfgWarpProbe").value || 60000),
     warpRotations: Number($("cfgWarpRotations").value || 0),
     warpRotateTries: Number($("cfgWarpRotateTries").value || 4),
+    switchSound: $("cfgSwitchSound").checked,
     rateLimitMax: $("cfgRateLimit").checked ? Number($("cfgRateMax").value || 0) : 0,
     rateLimitWindowMs: Number($("cfgRateWindow").value || 60000),
   }

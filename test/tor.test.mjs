@@ -260,7 +260,7 @@ function fakeLane(index, fingerprint, extra = {}) {
   }
 }
 
-function makeManager({ lanes = [], config = {}, mintIdentity, mintTrace } = {}) {
+function makeManager({ lanes = [], config = {}, mintIdentity, mintTrace, onSwitch } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-tor-run-"))
   const manager = createLanes({
     config: {
@@ -280,6 +280,7 @@ function makeManager({ lanes = [], config = {}, mintIdentity, mintTrace } = {}) 
     log: () => {},
     mintIdentity: mintIdentity ?? (() => ({ session: "ses_minted", project: "prj_minted" })),
     mintTrace: mintTrace ?? (() => ({ b3: "b3_minted", traceparent: "tp_minted" })),
+    onSwitch,
   })
   manager.lanes.push(...lanes)
   return manager
@@ -510,6 +511,19 @@ describe("sticky mode", () => {
       calls.map((c) => c.lane),
       [1],
     )
+  })
+
+  test("a refused exit rings the switch callback once", async () => {
+    const lanes = [fakeLane(0, "0".repeat(40)), fakeLane(1, "1".repeat(40))]
+    let rings = 0
+    const manager = makeManager({ lanes, config: { torSticky: true }, onSwitch: () => (rings += 1) })
+    stubPerLane({
+      0: () => new Response("Free usage limit reached", { status: 429 }),
+      1: ok200,
+    })
+    const res = await manager.fetch("https://opencode.ai/x", { headers: {} }, {})
+    assert.equal(res.status, 200)
+    assert.equal(rings, 1, "one sound for the hand-over, not one per retry")
   })
 
   test("anonymous calls carry the lane identity; a caller-owned one is untouched", async () => {

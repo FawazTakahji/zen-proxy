@@ -724,6 +724,9 @@ class Lane {
 export function createLanes(opts) {
   const config = opts.config
   const log = opts.log ?? (() => {})
+  // Called after a lane really changes exit (SETCONF/NEWNYM or a re-cook), so
+  // the proxy can surface the switch without tor.mjs knowing how.
+  const onSwitch = opts.onSwitch ?? (() => {})
   const mint =
     opts.mintIdentity ??
     (() => ({
@@ -1084,6 +1087,7 @@ export function createLanes(opts) {
     mintForLane(lane)
     await probeExit(lane)
     log(`${lane.label} moved${lane.exitIp ? ` to ${lane.exitIp}` : ""}${reason ? ` (${reason})` : ""}`)
+    onSwitch()
     return true
   }
 
@@ -1092,6 +1096,7 @@ export function createLanes(opts) {
     try {
       await bootLane(lane)
       log(`${lane.label} re-cooked${reason ? ` (${reason})` : ""}`)
+      onSwitch()
       return true
     } catch (err) {
       lane.state = "dead"
@@ -1478,6 +1483,7 @@ export function createLanes(opts) {
         ledger.note(lane.fingerprint, BLOCKED, now() + BLOCKED_COOLDOWN_MS)
         log(`${lane.label} ${err.message} — trying another exit`)
         pinnedIndex = -1
+        onSwitch()
         continue
       }
       if (res.status === 200) {
@@ -1512,11 +1518,13 @@ export function createLanes(opts) {
           log(`${lane.label} ${res.status} ${verdict.reason} — moving to another exit`)
         }
         pinnedIndex = -1
+        onSwitch()
         continue
       }
       if (res.status >= 500) {
         log(`${lane.label} ${res.status} — retrying on another exit`)
         pinnedIndex = -1
+        onSwitch()
         continue
       }
       // Any other status (400, 404) is the caller's answer, not an exit problem.
